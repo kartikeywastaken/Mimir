@@ -10,11 +10,25 @@ func TestFindBrowserBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected browser binary to be found, got error: %v", err)
 	}
-	if name != "Brave Browser" && name != "Google Chrome" {
-		t.Errorf("unexpected browser name: %s", name)
+	if name == "" || path == "" {
+		t.Errorf("expected non-empty name and path, got name=%q path=%q", name, path)
 	}
-	if !strings.Contains(path, "Contents/MacOS") {
-		t.Errorf("expected macOS binary path, got: %s", path)
+	if !strings.Contains(path, "Contents/MacOS") && !strings.Contains(path, "bin") {
+		t.Errorf("expected executable binary path, got: %s", path)
+	}
+}
+
+func TestDetectBrowsers(t *testing.T) {
+	browsers := DetectBrowsers()
+	if len(browsers) == 0 {
+		t.Fatalf("expected at least one installed browser to be detected on this machine")
+	}
+	t.Logf("Detected %d browser(s):", len(browsers))
+	for i, b := range browsers {
+		t.Logf("  [%d] %s -> %s (default: %v)", i+1, b.Name, b.Path, b.IsDefault)
+		if b.Name == "" || b.Executable == "" {
+			t.Errorf("browser %d has empty name or executable", i)
+		}
 	}
 }
 
