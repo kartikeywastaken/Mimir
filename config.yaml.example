@@ -1,0 +1,33 @@
+browser:
+  # Choose one: von (CDP ws://127.0.0.1:9222) or laya-browser (agent-browser + local Laya)
+  # Von: https://getvon.app — agentic browser with CDP
+  # laya-browser: https://github.com/Benny93/laya-browser — agent-browser + laya-mlx (local, no LLM token cost)
+  kind: "laya-browser"  # von | laya-browser | auto
+  cdp_url: "ws://127.0.0.1:9222"
+  http_url: "http://127.0.0.1:9222"
+  background_search_timeout: 8s
+
+laya:
+  # Local Laya typed-decision model — no API key, runs on-device
+  # Options share base model (ModernBERT-large + typed heads, Apache-2.0) but different runtimes:
+  # - layaForWeb: https://vishalmysore.github.io/layaForWeb/ — ONNX Runtime Web, WASM/WebGPU, 512 state / 192 per option, browser
+  # - laya-coreml: https://github.com/mizorewww/laya-coreml — Core ML ANE, ~5ms, 96 tokens (ANE) or 1024 (general), Apple Silicon
+  # - laya-mlx: https://github.com/mizorewww/laya-mlx — MLX, ~15ms, used by laya-browser (aac6fef/laya-mlx, ~800MB)
+  # They are NOT same repo: layaForWeb is Vishal Mysore's ONNX Web port; laya-coreml is mizorewww's Core ML port.
+  # laya-browser uses laya-mlx by default.
+  model: "aac6fef/laya-multilingual-coreml-ane"  # 96 tokens ANE fastest; or aac6fef/laya-mlx / aac6fef/laya-multilingual-coreml (1024)
+  # For layaForWeb you would run the WASM in a hidden tab instead; Mimir's Go solver uses laya-coreml/mlx directly.
+  instructions: "Which answer correctly answers the question?"
+  python: "python3"  # python bin for scripts/laya_solve.py
+
+solver:
+  enable_background_search: true  # hidden tab Google research (no focus switch) — feeds into Laya state
+  max_search_results: 5
+  confidence_auto_mark_threshold: 92
+
+overlay:
+  position: "top-right"
+  theme: "dark"
+
+extractor:
+  extra_selectors: []
