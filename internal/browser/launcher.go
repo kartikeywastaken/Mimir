@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	DefaultCDPURL   = "http://127.0.0.1:9222"
+	DefaultCDPURL     = "http://127.0.0.1:9222"
+	SearchCDPURL      = "http://127.0.0.1:9223"
 	DefaultProfileDir = "/tmp/brave-mimir"
 )
 
@@ -219,7 +220,7 @@ func LaunchBrowserWith(b BrowserInfo, targetURL string) error {
 	return nil
 }
 
-// WaitForCDP polls until CDP port 9222 is active or times out
+// WaitForCDP polls until CDP port 9222 has a "page" target or times out
 func WaitForCDP(cdpURL string, timeout time.Duration) (*von.Client, error) {
 	if cdpURL == "" {
 		cdpURL = DefaultCDPURL
@@ -228,14 +229,19 @@ func WaitForCDP(cdpURL string, timeout time.Duration) (*von.Client, error) {
 	for time.Now().Before(deadline) {
 		if IsCDPAvailable(cdpURL) {
 			v := von.New(cdpURL)
-			// Wait briefly for at least one target to be created
-			for i := 0; i < 5; i++ {
+			// Wait for an actual "page" target (not just extensions/service workers)
+			for i := 0; i < 20; i++ {
 				targets, err := v.ListTargets()
-				if err == nil && len(targets) > 0 {
-					return v, nil
+				if err == nil {
+					for _, t := range targets {
+						if t.Type == "page" {
+							return v, nil
+						}
+					}
 				}
-				time.Sleep(300 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
 			}
+			// Still no page target after 10s — return client anyway, polling will retry
 			return v, nil
 		}
 		time.Sleep(400 * time.Millisecond)
@@ -288,7 +294,11 @@ func strconvQuote(s string) string {
 func OpenURL(cdpURL, rawURL string) error {
 	rawURL = NormalizeURL(rawURL)
 	endpoint := fmt.Sprintf("%s/json/new?%s", cdpURL, url.QueryEscape(rawURL))
-	resp, err := http.Get(endpoint)
+	req, err := http.NewRequest("PUT", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -296,3 +306,43 @@ func OpenURL(cdpURL, rawURL string) error {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
+
+// EnsureHeadlessSearchBrowser starts a completely separate headless browser instance on port 9223.
+// This guarantees that all Google searches occur in an invisible background process,
+// so ZERO search tabs ever open inside the user's active quiz browser!
+func EnsureHeadlessSearchBrowser(b BrowserInfo) (*von.Client, error) {
+	if IsCDPAvailable(SearchCDPURL) {
+		return von.New(SearchCDPURL), nil
+	}
+
+	if b.Executable == "" {
+		detected := DetectBrowsers()
+		if len(detected) > 0 {
+			b = detected[0]
+		} else {
+			return nil, fmt.Errorf("no browser binary found for headless search")
+		}
+	}
+
+	profileDir := "/tmp/mimir-search-headless"
+	args := []string{
+		"--headless=new",
+		"--remote-debugging-port=9223",
+		"--user-data-dir=" + profileDir,
+		"--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+		"--disable-blink-features=AutomationControlled",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-gpu",
+		"--disable-extensions",
+		"about:blank",
+	}
+
+	cmd := exec.Command(b.Executable, args...)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to launch headless search browser: %w", err)
+	}
+
+	return WaitForCDP(SearchCDPURL, 10*time.Second)
+}
+

@@ -41,7 +41,7 @@ type Target struct {
 func (c *Client) ListTargets() ([]Target, error) {
 	resp, err := http.Get(c.HTTPBase + "/json")
 	if err != nil {
-		return nil, fmt.Errorf("von not reachable at %s: %w", c.HTTPBase, err)
+		return nil, fmt.Errorf("browser not reachable at %s: %w", c.HTTPBase, err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
@@ -52,24 +52,46 @@ func (c *Client) ListTargets() ([]Target, error) {
 	return t, nil
 }
 
-// ActiveTarget returns first page target (the visible tab)
+// ActiveTarget returns first page target (the visible tab).
+// Retries briefly because Brave/Chrome may register extension targets before the actual page.
 func (c *Client) ActiveTarget() (*Target, error) {
-	targets, err := c.ListTargets()
-	if err != nil {
-		return nil, err
-	}
-	for _, t := range targets {
-		if t.Type == "page" {
-			return &t, nil
+	var lastSeen []Target
+	for attempt := 0; attempt < 3; attempt++ {
+		targets, err := c.ListTargets()
+		if err != nil {
+			return nil, err
+		}
+		lastSeen = targets
+		for _, t := range targets {
+			if t.Type == "page" {
+				return &t, nil
+			}
+		}
+		if attempt < 2 {
+			time.Sleep(1 * time.Second)
 		}
 	}
-	return nil, fmt.Errorf("no page target found - is Von running?")
+	
+	// Create debug string
+	debugInfo := ""
+	for i, t := range lastSeen {
+		debugInfo += fmt.Sprintf("[%d] Type: %s, URL: %s | ", i, t.Type, t.URL)
+	}
+	if debugInfo == "" {
+		debugInfo = "No targets returned by browser."
+	}
+	
+	return nil, fmt.Errorf("no page target found - is your browser running? Targets seen: %s", debugInfo)
 }
 
 // CreateBackgroundTab creates a new tab WITHOUT focusing it.
 // Uses PUT /json/new?url - target is created in background, we don't call activate.
-func (c *Client) CreateBackgroundTab(url string) (*Target, error) {
-	resp, err := http.Get(c.HTTPBase + "/json/new?" + "url=" + url)
+func (c *Client) CreateBackgroundTab(targetURL string) (*Target, error) {
+	req, err := http.NewRequest("PUT", c.HTTPBase+"/json/new?"+url.QueryEscape(targetURL), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +102,7 @@ func (c *Client) CreateBackgroundTab(url string) (*Target, error) {
 		// some Von builds return empty on create, so list again
 		targets, _ := c.ListTargets()
 		for _, cand := range targets {
-			if cand.URL == url {
+			if cand.URL == targetURL {
 				return &cand, nil
 			}
 		}
@@ -198,8 +220,8 @@ func (c *Client) RemoveOverlay(wsURL string) error {
 	return err
 }
 
-// BackgroundSearch opens a hidden google tab, scrapes snippets, closes it.
-// This is the "recursive" trick - user never sees tab switch.
+// BackgroundSearch opens a hidden tab, scrapes snippets, closes it.
+// Starts with Google Search; if Google blocks with CAPTCHA or returns empty, automatically switches to Yahoo Search.
 func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string, error) {
 	if timeout == 0 {
 		timeout = 8 * time.Second
@@ -211,40 +233,83 @@ func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string
 	}
 	defer c.CloseTarget(t.ID)
 
-	// wait for page load
-	time.Sleep(2 * time.Second)
+	// wait for initial page load
+	time.Sleep(1500 * time.Millisecond)
 
-	// poll for results
-	js := `(function(){
-		const els = Array.from(document.querySelectorAll('div[data-sncf], div.g, div.MjjYud, a h3'));
-		// fallback: just grab text snippets
-		let out = [];
-		document.querySelectorAll('div.g, div.MjjYud').forEach(d=>{
-			let h = d.querySelector('h3');
-			let s = d.innerText || d.textContent;
-			if(h && s) out.push(h.innerText + ' - ' + s.slice(0,300));
-			if(out.length>=5) return;
+	googleJS := `(function(){
+		if (window.location.href.includes('google.com/sorry')) {
+			return JSON.stringify({ blocked: true });
+		}
+		const out = [];
+		const featured = document.querySelector('.hgKElc, [data-attrid="wa:/description"], .kno-rdesc span, .IZ6rdc');
+		if (featured) out.push('FEATURED: ' + featured.innerText.slice(0, 500));
+		
+		document.querySelectorAll('div.g, div.MjjYud').forEach(d => {
+			if (out.length >= 4) return;
+			const h = d.querySelector('h3');
+			const desc = d.querySelector('.VwiC3b, .IsZvec, [data-sncf]');
+			if (h && desc) out.push(h.innerText + ' — ' + desc.innerText.slice(0, 300));
 		});
-		if(out.length===0) out.push(document.body.innerText.slice(0,1200));
-		return JSON.stringify(out.slice(0,5));
+		return JSON.stringify({ blocked: false, results: out });
 	})()`
+
+	yahooJS := `(function(){
+		const out = [];
+		document.querySelectorAll('div.compText, .compText p, .algo-desc, .dd p').forEach(el => {
+			const t = (el.innerText || '').trim();
+			if (t.length > 20 && !out.includes(t)) out.push(t);
+		});
+		return JSON.stringify(out.slice(0, 5));
+	})()`
+
+	switchedToYahoo := false
 	deadline := time.Now().Add(timeout)
+
 	for time.Now().Before(deadline) {
-		res, err := c.Evaluate(t.WebSocketURL, js)
-		if err == nil && len(res) > 10 && res != `""` {
-			var arr []string
-			// res is JSON stringified array inside JSON string - double parse
-			var inner string
-			if json.Unmarshal([]byte(res), &inner) == nil {
-				json.Unmarshal([]byte(inner), &arr)
-			} else {
-				json.Unmarshal([]byte(res), &arr)
+		if !switchedToYahoo {
+			res, err := c.Evaluate(t.WebSocketURL, googleJS)
+			if err == nil && len(res) > 2 {
+				var parsed struct {
+					Blocked bool     `json:"blocked"`
+					Results []string `json:"results"`
+				}
+				var inner string
+				if json.Unmarshal([]byte(res), &inner) == nil {
+					_ = json.Unmarshal([]byte(inner), &parsed)
+				} else {
+					_ = json.Unmarshal([]byte(res), &parsed)
+				}
+
+				if parsed.Blocked || (time.Since(deadline.Add(-timeout)) > 3*time.Second && len(parsed.Results) == 0) {
+					// Google blocked by captcha or empty - switch to Yahoo
+					yahooURL := fmt.Sprintf("https://search.yahoo.com/search?p=%s", url.QueryEscape(query))
+					_, _ = c.Evaluate(t.WebSocketURL, fmt.Sprintf("window.location.href = %q;", yahooURL))
+					switchedToYahoo = true
+					time.Sleep(1500 * time.Millisecond)
+					continue
+				}
+
+				if len(parsed.Results) > 0 {
+					return parsed.Results, nil
+				}
 			}
-			if len(arr) > 0 && arr[0] != "" {
-				return arr, nil
+		} else {
+			res, err := c.Evaluate(t.WebSocketURL, yahooJS)
+			if err == nil && len(res) > 5 && res != `""` {
+				var arr []string
+				var inner string
+				if json.Unmarshal([]byte(res), &inner) == nil {
+					_ = json.Unmarshal([]byte(inner), &arr)
+				} else {
+					_ = json.Unmarshal([]byte(res), &arr)
+				}
+				if len(arr) > 0 && arr[0] != "" {
+					return arr, nil
+				}
 			}
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(700 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("background search timeout")
 }
+

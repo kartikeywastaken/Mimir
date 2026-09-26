@@ -20,16 +20,26 @@ import (
 type State int
 
 const (
-	StateURLInput State = iota
+	StateModePicker State = iota
+	StateURLInput
 	StateBrowserPicker
 	StateSlashModal
 	StateLaunchingBrowser
 	StateLoginPolling
 	StateIdle
 	StateExtracting
+	StateSearching
 	StateSolving
 	StateDone
 	StateError
+)
+
+type SolveMode int
+
+const (
+	ModeLocalAI SolveMode = iota
+	ModeWebSearch
+	ModeHybrid
 )
 
 type SlashCmd struct {
@@ -42,13 +52,36 @@ var allSlashCmds = []SlashCmd{
 	{Name: "/browser", Desc: "Select active browser (Brave, Chrome, Edge, Arc, Chromium)"},
 	{Name: "/solve", Desc: "Force immediate extraction & solving of current page"},
 	{Name: "/search", Desc: "Toggle background search augmentation ON/OFF"},
+	{Name: "/mode", Desc: "Change solving mode (Local AI, Web Search, Hybrid)"},
 	{Name: "/clear", Desc: "Clear activity log history"},
 	{Name: "/help", Desc: "Show available slash commands"},
 	{Name: "/quit", Desc: "Exit Mimir"},
 }
 
+// Purple Theme Palette
+var (
+	colorBgPurple     = lipgloss.Color("#110722") // deep obsidian purple canvas
+	colorCardPurple   = lipgloss.Color("#1c0d38") // card & modal container surface
+	colorBorderPurple = lipgloss.Color("#a855f7") // vibrant purple border
+	colorBorderDim    = lipgloss.Color("#4c1d95") // subtle divider / inner border
+	colorLogoPurple   = lipgloss.Color("#e879f9") // neon magenta / fuchsia logo
+	colorSubPurple    = lipgloss.Color("#c084fc") // soft lavender subtitle
+	colorMutedPurple  = lipgloss.Color("#8b5cf6") // secondary text
+	colorDimPurple    = lipgloss.Color("#7e629f") // hints / placeholders
+	colorInputBg      = lipgloss.Color("#251244") // textinput field background
+	colorWhite        = lipgloss.Color("#f8fafc") // bright text
+	colorGreen        = lipgloss.Color("#4ade80") // success / marked
+	colorYellow       = lipgloss.Color("#fde047") // spinner / warning
+	colorRed          = lipgloss.Color("#f87171") // error
+)
+
+const asciiBanner = `
+ M I M I R
+`
+
 type Model struct {
 	von       *von.Client
+	searchVon *von.Client
 	solverCfg solver.Config
 
 	state        State
@@ -59,6 +92,9 @@ type Model struct {
 	slashInput   textinput.Model
 	initialURL   string
 	pendingURL   string
+
+	solveMode    SolveMode
+	selectedMode int
 
 	// Browser selection
 	detectedBrowsers []browser.BrowserInfo
@@ -82,24 +118,32 @@ type Model struct {
 func New(v *von.Client, sc solver.Config, initialURL string) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	vp := viewport.New(80, 10)
-	vp.Style = lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	s.Style = lipgloss.NewStyle().Foreground(colorYellow)
+	vp := viewport.New(70, 6)
+	vp.Style = lipgloss.NewStyle().Padding(0, 1)
 
 	ti := textinput.New()
 	ti.Placeholder = "https://your-quiz.com (or press Enter for active tab)"
 	ti.Focus()
 	ti.CharLimit = 512
-	ti.Width = 65
+	ti.Width = 54
+	ti.Prompt = "► "
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(colorLogoPurple).Bold(true)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(colorWhite)
+	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(colorDimPurple)
 
 	si := textinput.New()
 	si.Placeholder = "Type a command (e.g. /link, /browser, /solve)..."
 	si.CharLimit = 256
 	si.Width = 50
+	si.Prompt = "► "
+	si.PromptStyle = lipgloss.NewStyle().Foreground(colorLogoPurple).Bold(true)
+	si.TextStyle = lipgloss.NewStyle().Foreground(colorWhite)
+	si.PlaceholderStyle = lipgloss.NewStyle().Foreground(colorDimPurple)
 
 	detected := browser.DetectBrowsers()
 
-	startState := StateURLInput
+	startState := StateModePicker
 	logs := []string{"Mimir ready — Local Laya + Universal Browser Support"}
 	if initialURL != "" {
 		startState = StateBrowserPicker
@@ -152,10 +196,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.viewport.Width = max(60, msg.Width-4)
-		m.viewport.Height = max(5, msg.Height-18)
-		m.urlInput.Width = max(40, msg.Width-16)
-		m.slashInput.Width = max(40, msg.Width-20)
+		bw := max(56, min(74, msg.Width-8))
+		m.viewport.Width = max(40, bw-4)
+		m.viewport.Height = max(4, min(8, msg.Height-20))
+		m.urlInput.Width = max(36, bw-12)
+		m.slashInput.Width = max(36, bw-12)
 		return m, nil
 
 	case browserLaunchedMsg:
@@ -173,6 +218,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			bName = m.detectedBrowsers[m.selectedBrowser].Name
 		}
 		m.log(fmt.Sprintf("✓ %s connected on port 9222!", bName))
+
+		// Ensure headless search browser is configured on port 9223 for stealth searching
+		if m.solveMode != ModeLocalAI {
+			var b browser.BrowserInfo
+			if len(m.detectedBrowsers) > m.selectedBrowser {
+				b = m.detectedBrowsers[m.selectedBrowser]
+			}
+			go func() {
+				_, _ = browser.EnsureHeadlessSearchBrowser(b)
+			}()
+			m.searchVon = von.New(browser.SearchCDPURL)
+			m.log("✓ Headless search browser configured on port 9223 (zero search tabs in quiz browser)")
+		}
+
 		m.log("-> checking page for questions or login...")
 		return m, tea.Batch(m.spinner.Tick, extractBatchCmd(m.von))
 
@@ -185,6 +244,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.state = StateIdle
 			return m, nil
+		}
+
+		// Check for embedded quiz iframes (e.g. Google Forms embedded in blog/LMS)
+		if msg.batch.EmbeddedQuizURL != "" {
+			m.log("🎯 Detected embedded quiz iframe: " + msg.batch.EmbeddedQuizURL)
+			m.log("-> Automatically navigating directly into the quiz...")
+			if m.von != nil {
+				_ = browser.NavigateTo(m.von, msg.batch.EmbeddedQuizURL)
+			}
+			m.state = StateExtracting
+			m.lastSolvedFingerprint = ""
+			return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return pollMsg(t) })
 		}
 
 		// Check if it's a login screen or empty page
@@ -200,31 +271,76 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Questions found! Check if question set has changed
 		fingerprint := makeFingerprint(msg.batch.Questions)
 		if fingerprint == m.lastSolvedFingerprint && m.lastSolvedFingerprint != "" {
-			// Already solved these questions, poll again in 5s
 			m.state = StateDone
-			return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return pollMsg(t) })
+			m.log(fmt.Sprintf("● questions unchanged (%d question(s) already solved & marked). Waiting for new questions...", len(m.questions)))
+			if m.autoMode {
+				return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return pollMsg(t) })
+			}
+			return m, nil
 		}
 
 		m.questions = msg.batch.Questions
-		m.state = StateSolving
-		m.log(fmt.Sprintf("✓ detected %d question(s) on page! Auto-solving with local Laya...", len(m.questions)))
-		return m, solveAllQuestionsCmd(m.von, m.solverCfg, m.questions, m.useSearch)
-
-	case multiSolvedMsg:
-		if msg.err != nil {
-			m.state = StateError
-			m.errMsg = msg.err.Error()
-			m.log("x solve error: " + msg.err.Error())
-			return m, nil
+		m.currentQIdx = 0
+		if m.solveMode != ModeLocalAI {
+			m.state = StateSearching
+			m.log(fmt.Sprintf("✓ detected %d quiz question(s) on page! Starting step-by-step solving...", len(m.questions)))
+			m.log(fmt.Sprintf("[Q1/%d] 🌐 Searching Google in headless background browser (port 9223)...", len(m.questions)))
+		} else {
+			m.state = StateSolving
+			m.log(fmt.Sprintf("✓ detected %d quiz question(s) on page! Starting step-by-step solving...", len(m.questions)))
+			m.log(fmt.Sprintf("[Q1/%d] 🧠 Evaluating choices with Local Laya...", len(m.questions)))
 		}
-		m.questions = msg.questions
-		m.lastSolvedFingerprint = makeFingerprint(m.questions)
+		return m, solveSingleQuestionCmd(m.von, m.searchVon, m.solverCfg, m.questions, 0, m.solveMode)
+
+	case questionStepSolvedMsg:
+		idx := msg.Index
+		if idx >= 0 && idx < len(m.questions) {
+			m.questions[idx].SolvedAns = msg.SolvedAns
+			m.questions[idx].Confidence = msg.Confidence
+			m.questions[idx].Marked = true
+		}
+
+		if m.solveMode != ModeLocalAI {
+			if len(msg.Snippets) > 0 {
+				m.log(fmt.Sprintf("[Q%d/%d] 🌐 Google snippets found -> Laya chose %s (%d%%) ✓ marked in DOM", idx+1, msg.Total, msg.SolvedAns, msg.Confidence))
+			} else {
+				m.log(fmt.Sprintf("[Q%d/%d] ! No Google snippets found -> Local Laya fallback chose %s (%d%%) ✓ marked in DOM", idx+1, msg.Total, msg.SolvedAns, msg.Confidence))
+			}
+		} else {
+			m.log(fmt.Sprintf("[Q%d/%d] 🧠 Local Laya chose %s (%d%%) ✓ marked in DOM", idx+1, msg.Total, msg.SolvedAns, msg.Confidence))
+		}
+
+		if idx+1 < msg.Total {
+			m.currentQIdx = idx + 1
+			delay := 400 * time.Millisecond
+			if m.solveMode != ModeLocalAI {
+				delay = 2 * time.Second // 2s delay between background search requests
+			}
+			return m, tea.Tick(delay, func(t time.Time) tea.Msg {
+				return nextQuestionMsg{Index: idx + 1}
+			})
+		}
+
+		// All questions completed!
 		m.state = StateDone
-		m.log(fmt.Sprintf("✓ all %d question(s) solved & automatically marked in page DOM! (no popups)", len(m.questions)))
+		m.lastSolvedFingerprint = makeFingerprint(m.questions)
+		m.log(fmt.Sprintf("✓ All %d question(s) solved & automatically marked in page DOM! (no popups)", len(m.questions)))
 
 		if m.autoMode {
-			// Continue auto-pilot tracking for next page/questions after 5s
 			return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return pollMsg(t) })
+		}
+		return m, nil
+
+	case nextQuestionMsg:
+		if msg.Index < len(m.questions) {
+			if m.solveMode != ModeLocalAI {
+				m.state = StateSearching
+				m.log(fmt.Sprintf("[Q%d/%d] 🌐 Searching Google in headless background browser...", msg.Index+1, len(m.questions)))
+			} else {
+				m.state = StateSolving
+				m.log(fmt.Sprintf("[Q%d/%d] 🧠 Evaluating choices with Local Laya...", msg.Index+1, len(m.questions)))
+			}
+			return m, solveSingleQuestionCmd(m.von, m.searchVon, m.solverCfg, m.questions, msg.Index, m.solveMode)
 		}
 		return m, nil
 
@@ -279,6 +395,36 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Global Quit
 	if msg.Type == tea.KeyCtrlC {
 		return m, tea.Quit
+	}
+
+	// 0. Mode Picker Modal
+	if m.state == StateModePicker {
+		switch msg.String() {
+		case "esc":
+			m.solveMode = ModeLocalAI
+			m.state = StateURLInput
+			return m, nil
+		case "up":
+			if m.selectedMode > 0 {
+				m.selectedMode--
+			}
+			return m, nil
+		case "down":
+			if m.selectedMode < 2 {
+				m.selectedMode++
+			}
+			return m, nil
+		case "enter":
+			m.solveMode = SolveMode(m.selectedMode)
+			m.state = StateURLInput
+			return m, nil
+		case "1", "2", "3":
+			idx := int(msg.String()[0] - '1')
+			m.solveMode = SolveMode(idx)
+			m.state = StateURLInput
+			return m, nil
+		}
+		return m, nil
 	}
 
 	// 1. Slash Command Modal
@@ -376,14 +522,26 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if m.von != nil {
 			m.state = StateExtracting
+			m.lastSolvedFingerprint = ""
 			m.log("-> extracting questions from page...")
 			return m, extractBatchCmd(m.von)
 		}
 	case "s":
 		if m.von != nil && len(m.questions) > 0 {
-			m.state = StateSolving
-			m.log("-> solving questions with Laya...")
-			return m, solveAllQuestionsCmd(m.von, m.solverCfg, m.questions, m.useSearch)
+			m.currentQIdx = 0
+			for i := range m.questions {
+				m.questions[i].Marked = false
+			}
+			if m.solveMode != ModeLocalAI {
+				m.state = StateSearching
+				m.log(fmt.Sprintf("-> re-solving %d question(s) with Web Search...", len(m.questions)))
+				m.log(fmt.Sprintf("[Q1/%d] 🌐 Searching Google in headless background browser (port 9223)...", len(m.questions)))
+			} else {
+				m.state = StateSolving
+				m.log(fmt.Sprintf("-> re-solving %d question(s) with Local Laya...", len(m.questions)))
+				m.log(fmt.Sprintf("[Q1/%d] 🧠 Evaluating choices with Local Laya...", len(m.questions)))
+			}
+			return m, solveSingleQuestionCmd(m.von, m.searchVon, m.solverCfg, m.questions, 0, m.solveMode)
 		}
 	case "a":
 		m.autoMode = !m.autoMode
@@ -465,6 +623,11 @@ func (m *Model) executeSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.log(fmt.Sprintf("✓ background search toggled: %v", m.useSearch))
 		return m, nil
 
+	case "/mode":
+		m.state = StateModePicker
+		m.selectedMode = int(m.solveMode)
+		return m, nil
+
 	case "/clear":
 		m.logs = []string{"Logs cleared."}
 		m.viewport.SetContent("")
@@ -485,195 +648,343 @@ func (m *Model) executeSlashCommand(input string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) View() string {
-	// Centered Header Banner
-	centerStyle := lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width)
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("o MIMIR")
-	sub := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Universal Browser Auto-Answer (Local Laya)  •  Zero Popups  •  Local AI")
-	header := centerStyle.Render(lipgloss.JoinVertical(lipgloss.Center, title, sub))
+func (m Model) renderHeader() string {
+	logo := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(colorLogoPurple).
+		Background(colorBgPurple).
+		Render(asciiBanner)
 
-	// Modal Overlays
-	if m.state == StateSlashModal {
-		return m.renderSlashModal(header)
+	sub := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(colorSubPurple).
+		Background(colorBgPurple).
+		Render("Universal Browser Auto-Answer  •  Local Laya AI  •  Zero Popups")
+
+	return lipgloss.JoinVertical(lipgloss.Center, logo, "", sub)
+}
+
+func (m Model) placeCentered(content string) string {
+	w := m.width
+	h := m.height
+	cw := lipgloss.Width(content)
+	ch := lipgloss.Height(content)
+	if w < cw {
+		w = cw
 	}
-	if m.state == StateBrowserPicker {
-		return m.renderBrowserPicker(header)
+	if h < ch {
+		h = ch
 	}
-
-	// URL Input Box
-	if m.state == StateURLInput {
-		inputBox := lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("205")).
-			Padding(1, 2).
-			Width(m.viewport.Width).
-			Render(
-				lipgloss.JoinVertical(lipgloss.Left,
-					lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("Enter Quiz / Exam URL:"),
-					"",
-					m.urlInput.View(),
-					"",
-					lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("• Press Enter to select browser and launch directly to this URL."),
-					lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("• Press '/' for slash commands  •  Esc to cancel"),
-				),
-			)
-
-		m.viewport.SetContent(strings.Join(m.logs, "\n"))
-		m.viewport.GotoBottom()
-		return lipgloss.JoinVertical(lipgloss.Left,
-			header,
-			"",
-			inputBox,
-			"",
-			m.viewport.View(),
-			"",
-			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Enter submit  •  / commands  •  Esc / Ctrl+C quit"),
-		)
-	}
-
-	// Status Line
-	status := ""
-	switch m.state {
-	case StateLaunchingBrowser:
-		status = m.spinner.View() + " launching browser on port 9222..."
-	case StateLoginPolling:
-		status = m.spinner.View() + " [POLLING] Waiting for login / questions (silent check every 10s)..."
-	case StateIdle:
-		status = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("● idle (press '/' for commands)")
-	case StateExtracting:
-		status = m.spinner.View() + " extracting questions from page..."
-	case StateSolving:
-		status = m.spinner.View() + " Laya solving multiple questions" + map[bool]string{true: " + background search...", false: "..."}[m.useSearch]
-	case StateDone:
-		status = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42")).Render(fmt.Sprintf("✓ %d question(s) solved & marked in DOM (no popups)", len(m.questions)))
-	case StateError:
-		status = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("x " + m.errMsg)
-	}
-
-	// Questions Box (Multi-Question Display)
-	qBoxStyle := lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1).Width(m.viewport.Width)
-	qContent := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("(no questions detected yet - waiting for login or page load)")
-
-	if len(m.questions) > 0 {
-		var blocks []string
-		for i, q := range m.questions {
-			qHeader := lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("[%d] %s", i+1, q.Text))
-			if q.Marked {
-				qHeader += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render(fmt.Sprintf("[MARKED ✓ %s (%d%%)]", q.SolvedAns, q.Confidence))
-			}
-			var choiceLines []string
-			for _, ch := range q.Choices {
-				prefix := "  "
-				mark := ""
-				if q.SolvedAns == ch.Label {
-					prefix = "► "
-					mark = " <"
-					choiceLines = append(choiceLines, lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render(fmt.Sprintf("  %s%s) %s%s", prefix, ch.Label, ch.Text, mark)))
-				} else {
-					choiceLines = append(choiceLines, fmt.Sprintf("  %s%s) %s", prefix, ch.Label, ch.Text))
-				}
-			}
-			blocks = append(blocks, qHeader+"\n"+strings.Join(choiceLines, "\n"))
-		}
-		qContent = strings.Join(blocks, "\n\n")
-	}
-
-	// Logs Viewport
-	m.viewport.SetContent(strings.Join(m.logs, "\n"))
-	m.viewport.GotoBottom()
-	logsView := m.viewport.View()
-
-	// Keys & Footer
-	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(
-		"/ slash menu  •  e extract  •  s solve  •  a auto-pilot (" + map[bool]string{true: "ON", false: "OFF"}[m.autoMode] + ")  •  g search (" + map[bool]string{true: "ON", false: "OFF"}[m.useSearch] + ")  •  q quit",
-	)
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		"",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(status),
-		"",
-		qBoxStyle.Render(qContent),
-		"",
-		logsView,
-		"",
-		keys,
+	return lipgloss.Place(
+		w, h,
+		lipgloss.Center, lipgloss.Center,
+		content,
+		lipgloss.WithWhitespaceBackground(colorBgPurple),
 	)
 }
 
+func (m Model) renderModePicker(header string) string {
+	boxWidth := max(58, min(72, m.width-8))
+	
+	options := []struct{ name, desc string }{
+		{"1. 🧠 Local AI", "(Laya on-device, fully offline)"},
+		{"2. 🌐 Web Search", "(Google lookup via your browser, needs internet)"},
+		{"3. ⚡ Hybrid", "(search + AI, best accuracy)"},
+	}
+	
+	var items []string
+	for i, opt := range options {
+		cursor := "  "
+		style := lipgloss.NewStyle().Foreground(colorWhite).Background(colorCardPurple)
+		if i == m.selectedMode {
+			cursor = "► "
+			style = lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple)
+		}
+		items = append(items, style.Render(fmt.Sprintf("%s%s %s", cursor, opt.name, opt.desc)))
+	}
+
+	pickerBox := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorderPurple).
+		Background(colorCardPurple).
+		Padding(1, 2).
+		Width(boxWidth).
+		Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("Select Solving Mode:"),
+				"",
+				strings.Join(items, "\n"),
+				"",
+				lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("↑/↓ select  •  Enter confirm  •  1-3 shortcuts  •  Esc skip (defaults to Local AI)"),
+			),
+		)
+
+	content := lipgloss.JoinVertical(lipgloss.Center,
+		header,
+		"",
+		pickerBox,
+	)
+	return m.placeCentered(content)
+}
+
+func (m Model) renderURLInput(header string) string {
+	boxWidth := max(58, min(72, m.width-8))
+
+	inputBox := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorderPurple).
+		Background(colorCardPurple).
+		Padding(1, 2).
+		Width(boxWidth).
+		Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("Enter Quiz / Exam URL:"),
+				"",
+				lipgloss.NewStyle().Background(colorInputBg).Padding(0, 1).Render(m.urlInput.View()),
+				"",
+				lipgloss.NewStyle().Foreground(colorSubPurple).Background(colorCardPurple).Render("• Press Enter to select browser and launch directly to this URL."),
+				lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("• Press '/' for slash commands  •  Esc to cancel"),
+			),
+		)
+
+	// Activity log view
+	m.viewport.Width = boxWidth - 4
+	m.viewport.Height = 4
+	m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	m.viewport.GotoBottom()
+
+	logBox := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorderDim).
+		Background(colorCardPurple).
+		Padding(0, 1).
+		Width(boxWidth).
+		Render(m.viewport.View())
+
+	footer := lipgloss.NewStyle().
+		Foreground(colorDimPurple).
+		Render("Enter submit  •  / commands  •  Esc / Ctrl+C quit")
+
+	content := lipgloss.JoinVertical(lipgloss.Center,
+		header,
+		"",
+		inputBox,
+		"",
+		logBox,
+		"",
+		footer,
+	)
+
+	return m.placeCentered(content)
+}
+
 func (m Model) renderSlashModal(header string) string {
+	boxWidth := max(58, min(72, m.width-8))
 	var items []string
 	for i, c := range m.slashFiltered {
 		cursor := "  "
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+		style := lipgloss.NewStyle().Foreground(colorWhite).Background(colorCardPurple)
 		if i == m.slashFilteredIdx {
 			cursor = "► "
-			style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+			style = lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple)
 		}
 		items = append(items, style.Render(fmt.Sprintf("%s%-14s %s", cursor, c.Name, c.Desc)))
 	}
 
 	modalBox := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("205")).
+		BorderForeground(colorBorderPurple).
+		Background(colorCardPurple).
 		Padding(1, 2).
-		Width(max(50, m.viewport.Width-10)).
+		Width(boxWidth).
 		Render(
 			lipgloss.JoinVertical(lipgloss.Left,
-				lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("Slash Commands:"),
+				lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("Slash Commands:"),
 				"",
-				m.slashInput.View(),
+				lipgloss.NewStyle().Background(colorInputBg).Padding(0, 1).Render(m.slashInput.View()),
 				"",
 				strings.Join(items, "\n"),
 				"",
-				lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("↑/↓ navigate  •  Enter select  •  Esc close"),
+				lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("↑/↓ navigate  •  Enter select  •  Esc close"),
 			),
 		)
 
-	return lipgloss.JoinVertical(lipgloss.Center,
+	content := lipgloss.JoinVertical(lipgloss.Center,
 		header,
 		"",
 		modalBox,
 	)
+	return m.placeCentered(content)
 }
 
 func (m Model) renderBrowserPicker(header string) string {
+	boxWidth := max(58, min(72, m.width-8))
 	var items []string
 	for i, b := range m.detectedBrowsers {
 		cursor := "  "
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+		style := lipgloss.NewStyle().Foreground(colorWhite).Background(colorCardPurple)
 		if i == m.selectedBrowser {
 			cursor = "► "
-			style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+			style = lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Background(colorCardPurple)
 		}
 		items = append(items, style.Render(fmt.Sprintf("%s%d. %s  (%s)", cursor, i+1, b.Name, b.Path)))
 	}
 
 	if len(items) == 0 {
-		items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("No Chromium-based browsers detected!"))
+		items = append(items, lipgloss.NewStyle().Foreground(colorRed).Background(colorCardPurple).Render("No Chromium-based browsers detected!"))
 	}
 
 	pickerBox := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("42")).
+		BorderForeground(colorBorderPurple).
+		Background(colorCardPurple).
 		Padding(1, 2).
-		Width(max(55, m.viewport.Width-6)).
+		Width(boxWidth).
 		Render(
 			lipgloss.JoinVertical(lipgloss.Left,
-				lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42")).Render("Select Browser to Launch:"),
-				lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Mimir runs cleanly in the background with zero popups."),
+				lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("Select Browser to Launch:"),
+				lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("Mimir runs cleanly in the background with zero popups."),
 				"",
 				strings.Join(items, "\n"),
 				"",
-				lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("↑/↓ select  •  Enter launch  •  1-9 key shortcut  •  Esc cancel"),
+				lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("↑/↓ select  •  Enter launch  •  1-9 key shortcut  •  Esc cancel"),
 			),
 		)
 
-	return lipgloss.JoinVertical(lipgloss.Center,
+	content := lipgloss.JoinVertical(lipgloss.Center,
 		header,
 		"",
 		pickerBox,
 	)
+	return m.placeCentered(content)
+}
+
+func (m Model) View() string {
+	header := m.renderHeader()
+
+	if m.state == StateModePicker {
+		return m.renderModePicker(header)
+	}
+	if m.state == StateSlashModal {
+		return m.renderSlashModal(header)
+	}
+	if m.state == StateBrowserPicker {
+		return m.renderBrowserPicker(header)
+	}
+	if m.state == StateURLInput {
+		return m.renderURLInput(header)
+	}
+
+	dashWidth := max(60, min(84, m.width-6))
+
+	// Status line text
+	status := ""
+	switch m.state {
+	case StateLaunchingBrowser:
+		status = m.spinner.View() + " Launching browser on port 9222..."
+	case StateLoginPolling:
+		status = m.spinner.View() + " Waiting for quiz page to load (silent check every 10s)..."
+	case StateIdle:
+		status = "● Ready"
+	case StateExtracting:
+		status = m.spinner.View() + " Scanning page for questions..."
+	case StateSearching:
+		status = m.spinner.View() + " Searching Google in headless background browser (port 9223)..."
+	case StateSolving:
+		status = m.spinner.View() + " Evaluating answers with Local Laya..."
+	case StateDone:
+		status = fmt.Sprintf("✓ %d question(s) solved & marked in DOM", len(m.questions))
+	case StateError:
+		status = "x " + m.errMsg
+	}
+
+	// 1. Title bar inside the unified card
+	browserName := "Browser Connected"
+	if m.selectedBrowser < len(m.detectedBrowsers) {
+		browserName = m.detectedBrowsers[m.selectedBrowser].Name
+	}
+	modeStr := "Local AI"
+	if m.solveMode == ModeWebSearch {
+		modeStr = "Web Search (Headless 9223)"
+	} else if m.solveMode == ModeHybrid {
+		modeStr = "Hybrid (Headless 9223)"
+	}
+
+	titleBar := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("M I M I R"),
+		lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("  ❖  "),
+		lipgloss.NewStyle().Foreground(colorSubPurple).Background(colorCardPurple).Render(browserName),
+		lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("  ❖  "),
+		lipgloss.NewStyle().Foreground(colorWhite).Background(colorCardPurple).Render("Mode: "+modeStr),
+	)
+
+	statusLine := lipgloss.NewStyle().Foreground(colorYellow).Background(colorCardPurple).Render("Status: " + status)
+	divider := lipgloss.NewStyle().Foreground(colorBorderDim).Background(colorCardPurple).Render(strings.Repeat("─", dashWidth-4))
+
+	// 2. Questions Section (Clean & Compact)
+	var qLines []string
+	qHeader := lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("QUESTIONS")
+	qLines = append(qLines, qHeader)
+
+	if len(m.questions) == 0 {
+		qLines = append(qLines, lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("  (no questions detected yet - waiting for quiz page load)"))
+	} else {
+		for i, q := range m.questions {
+			qText := q.Text
+			if len(qText) > 60 {
+				qText = qText[:57] + "..."
+			}
+			line := fmt.Sprintf("  [%d] %s", i+1, qText)
+			if q.Marked {
+				ansDisplay := q.SolvedAns
+				if len(ansDisplay) > 28 {
+					ansDisplay = ansDisplay[:25] + "..."
+				}
+				line += "  " + lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Background(colorCardPurple).Render(fmt.Sprintf("→ %s ✓ (%d%%)", ansDisplay, q.Confidence))
+			}
+			qLines = append(qLines, lipgloss.NewStyle().Foreground(colorWhite).Background(colorCardPurple).Render(line))
+		}
+	}
+
+	// 3. Activity Section (Last 5 log lines, clean monospace)
+	var logLines []string
+	logHeader := lipgloss.NewStyle().Bold(true).Foreground(colorLogoPurple).Background(colorCardPurple).Render("ACTIVITY")
+	logLines = append(logLines, logHeader)
+	start := 0
+	if len(m.logs) > 5 {
+		start = len(m.logs) - 5
+	}
+	for _, l := range m.logs[start:] {
+		logLines = append(logLines, lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorCardPurple).Render("  "+l))
+	}
+
+	// Build Unified Card Content
+	cardContent := lipgloss.JoinVertical(lipgloss.Left,
+		titleBar,
+		statusLine,
+		divider,
+		strings.Join(qLines, "\n"),
+		divider,
+		strings.Join(logLines, "\n"),
+	)
+
+	unifiedCard := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorderPurple).
+		Background(colorCardPurple).
+		Padding(1, 2).
+		Width(dashWidth).
+		Render(cardContent)
+
+	footer := lipgloss.NewStyle().Foreground(colorDimPurple).Background(colorBgPurple).Render(
+		"/ commands  •  s solve  •  e extract  •  m mode  •  q quit",
+	)
+
+	return m.placeCentered(lipgloss.JoinVertical(lipgloss.Center,
+		unifiedCard,
+		"",
+		footer,
+	))
 }
 
 func (m *Model) log(s string) {
@@ -711,6 +1022,13 @@ func max(a, b int) int {
 	return b
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Commands
 
 func launchBrowserWithCmd(b browser.BrowserInfo, targetURL string) tea.Cmd {
@@ -719,7 +1037,7 @@ func launchBrowserWithCmd(b browser.BrowserInfo, targetURL string) tea.Cmd {
 		if err != nil {
 			return browserLaunchedMsg{nil, err}
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(3 * time.Second) // Brave needs time to register page target after CDP is up
 		return browserLaunchedMsg{v, nil}
 	}
 }
@@ -745,37 +1063,80 @@ func extractBatchCmd(v *von.Client) tea.Cmd {
 	}
 }
 
-func solveAllQuestionsCmd(v *von.Client, sc solver.Config, questions []extractor.Question, useSearch bool) tea.Cmd {
+type questionStepSolvedMsg struct {
+	Index      int
+	Total      int
+	SolvedAns  string
+	Confidence int
+	Snippets   []string
+	Query      string
+	Err        error
+}
+
+type nextQuestionMsg struct {
+	Index int
+}
+
+func solveSingleQuestionCmd(quizVon, searchVon *von.Client, sc solver.Config, questions []extractor.Question, idx int, solveMode SolveMode) tea.Cmd {
 	return func() tea.Msg {
-		var solved []extractor.Question
-
-		for _, q := range questions {
-			res, err := solver.Solve(&q, nil, sc)
-			if err != nil {
-				// Fallback to mock guess
-				ans := "A"
-				if len(q.Choices) > 1 {
-					ans = q.Choices[0].Label
-				}
-				q.SolvedAns = ans
-				q.Confidence = 50
-			} else {
-				q.SolvedAns = res.Answer
-				q.Confidence = res.Confidence
-			}
-
-			// Combined Robust Dispatch: mark answer in browser DOM (no popups)
-			if v != nil {
-				t, err := v.ActiveTarget()
-				if err == nil && t != nil {
-					markJS := extractor.MarkAnswerJS(q.Index, q.SolvedAns)
-					_, _ = v.Evaluate(t.WebSocketURL, markJS)
-					q.Marked = true
-				}
-			}
-			solved = append(solved, q)
+		if idx >= len(questions) {
+			return questionStepSolvedMsg{Index: idx, Total: len(questions), SolvedAns: "A", Confidence: 50}
 		}
 
-		return multiSolvedMsg{questions: solved, err: nil}
+		q := questions[idx]
+		var snippets []string
+		var searchErr error
+		var query string
+
+		if solveMode != ModeLocalAI {
+			query = q.Text
+			for _, c := range q.Choices {
+				query += " " + c.Text
+			}
+
+			// Ensure search client uses dedicated headless browser on port 9223 (zero search tabs in quiz browser!)
+			clientToSearch := searchVon
+			if clientToSearch == nil || !browser.IsCDPAvailable(browser.SearchCDPURL) {
+				sClient, err := browser.EnsureHeadlessSearchBrowser(browser.BrowserInfo{})
+				if err == nil && sClient != nil {
+					clientToSearch = sClient
+				} else {
+					clientToSearch = quizVon
+				}
+			}
+
+			if clientToSearch != nil {
+				snippets, searchErr = clientToSearch.BackgroundSearch(query, 10*time.Second)
+			}
+		}
+
+		res, err := solver.Solve(&q, snippets, sc)
+		ans := "A"
+		conf := 50
+		if err == nil && res != nil {
+			ans = res.Answer
+			conf = res.Confidence
+		} else if len(q.Choices) > 0 {
+			ans = q.Choices[0].Label
+		}
+
+		// Mark in active quiz browser DOM
+		if quizVon != nil {
+			t, err := quizVon.ActiveTarget()
+			if err == nil && t != nil {
+				markJS := extractor.MarkAnswerJS(q.Index, ans)
+				_, _ = quizVon.Evaluate(t.WebSocketURL, markJS)
+			}
+		}
+
+		return questionStepSolvedMsg{
+			Index:      idx,
+			Total:      len(questions),
+			SolvedAns:  ans,
+			Confidence: conf,
+			Snippets:   snippets,
+			Query:      query,
+			Err:        searchErr,
+		}
 	}
 }
