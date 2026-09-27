@@ -35,9 +35,9 @@ func DetectBrowsers() []BrowserInfo {
 	home := os.Getenv("HOME")
 
 	type candidate struct {
-		name       string
-		macPaths   []string
-		linuxCmds  []string
+		name      string
+		macPaths  []string
+		linuxCmds []string
 	}
 
 	candidates := []candidate{
@@ -265,7 +265,12 @@ func EnsureBrowserWith(b BrowserInfo, targetURL string) (*von.Client, error) {
 			return nil, err
 		}
 	} else if targetURL != "" {
-		_ = OpenURL(DefaultCDPURL, targetURL)
+		// Keep a single, deterministic quiz target. Opening another tab makes a
+		// later "first page" lookup ambiguous and can fill the wrong page.
+		v := von.New(DefaultCDPURL)
+		if err := NavigateTo(v, targetURL); err != nil {
+			return nil, err
+		}
 	}
 	return WaitForCDP(DefaultCDPURL, 15*time.Second)
 }
@@ -345,4 +350,3 @@ func EnsureHeadlessSearchBrowser(b BrowserInfo) (*von.Client, error) {
 
 	return WaitForCDP(SearchCDPURL, 10*time.Second)
 }
-

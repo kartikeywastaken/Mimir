@@ -46,7 +46,7 @@ func main() {
 	}
 
 	m := tui.New(v, sc, initialURL)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)

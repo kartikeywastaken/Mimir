@@ -6,6 +6,8 @@ RAMDISK := /tmp/ramdisk
 RAMDISK_DMG := /tmp/ramdisk.dmg
 UV_CACHE := $(RAMDISK)/uv-cache
 HF_CACHE := $(RAMDISK)/hf-home
+GO_CACHE := $(RAMDISK)/go-cache
+GO_TMP := $(RAMDISK)/go-tmp
 
 ramdisk:
 	@if ! mount | grep -qE 'on (/private)?$(RAMDISK) '; then \
@@ -16,28 +18,28 @@ ramdisk:
 		fi; \
 		hdiutil attach $(RAMDISK_DMG) -mountpoint $(RAMDISK) >/dev/null 2>&1 || true; \
 	fi
-	@mkdir -p $(UV_CACHE) $(RAMDISK)/uv-tools $(HF_CACHE)
+	@mkdir -p $(UV_CACHE) $(RAMDISK)/uv-tools $(HF_CACHE) $(GO_CACHE) $(GO_TMP)
 	@echo "✓ RAM disk at $(RAMDISK)"
 
 setup: ramdisk
 	@TMPDIR=$(RAMDISK) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) bash ./scripts/setup.sh
 
 run: ramdisk
-	TMPDIR=$(RAMDISK) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go run ./cmd/mimir $(URL)
+	TMPDIR=$(RAMDISK) GOCACHE=$(GO_CACHE) GOTMPDIR=$(GO_TMP) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go run ./cmd/mimir $(URL)
 
 build: ramdisk
 	@mkdir -p ./bin
 	@rm -f ./bin/mimir $(RAMDISK)/mimir
-	TMPDIR=$(RAMDISK) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go build -o $(RAMDISK)/mimir ./cmd/mimir
+	TMPDIR=$(RAMDISK) GOCACHE=$(GO_CACHE) GOTMPDIR=$(GO_TMP) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go build -o $(RAMDISK)/mimir ./cmd/mimir
 	cat $(RAMDISK)/mimir > ./bin/mimir && chmod +x ./bin/mimir
 	@echo "✓ bin/mimir — built via $(RAMDISK) workaround"
 
 tidy: ramdisk
-	TMPDIR=$(RAMDISK) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go mod tidy
+	TMPDIR=$(RAMDISK) GOCACHE=$(GO_CACHE) GOTMPDIR=$(GO_TMP) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go mod tidy
 	go fmt ./...
 
 test: ramdisk
-	TMPDIR=$(RAMDISK) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go test ./... -v
+	TMPDIR=$(RAMDISK) GOCACHE=$(GO_CACHE) GOTMPDIR=$(GO_TMP) UV_CACHE_DIR=$(UV_CACHE) HF_HOME=$(HF_CACHE) go test ./... -v
 
 # gum-powered quick launcher (no TUI, just gum)
 gum-demo:
@@ -48,4 +50,3 @@ clean-ramdisk:
 	hdiutil detach $(RAMDISK) 2>/dev/null || true
 	rm -f $(RAMDISK_DMG)
 	rm -rf $(RAMDISK)
-

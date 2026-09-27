@@ -3,6 +3,8 @@ package solver
 import (
 	"strings"
 	"testing"
+
+	"mimir/internal/extractor"
 )
 
 func TestExtractAnswerUniversalDomains(t *testing.T) {
@@ -77,5 +79,39 @@ func TestExtractAnswerUniversalDomains(t *testing.T) {
 				t.Errorf("extractAnswerFromSnippets(%q) = %q, want %q", tc.query, ans, tc.expected)
 			}
 		})
+	}
+}
+
+func TestWebSolverNeverFabricatesWithoutEvidence(t *testing.T) {
+	q := &extractor.Question{Type: extractor.TypeText, Text: "What is the capital of France?"}
+	result, err := SolveWeb(q, nil)
+	if err == nil || result != nil {
+		t.Fatalf("missing evidence must be unresolved, got result=%+v err=%v", result, err)
+	}
+}
+
+func TestWebSolverReturnsEvidenceBackedText(t *testing.T) {
+	q := &extractor.Question{Type: extractor.TypeText, Text: "What is the capital of France?"}
+	result, err := SolveWeb(q, []Evidence{{Title: "France", URL: "https://example.test/france", Passage: "The capital of France is Paris."}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Answer == "" || strings.Contains(result.Answer, q.Text) || result.Backend == "mock" {
+		t.Fatalf("expected a real evidence-backed answer, got %+v", result)
+	}
+}
+
+func TestWebSolverSupportsMultipleCheckboxValues(t *testing.T) {
+	q := &extractor.Question{
+		Type:    extractor.TypeCheckbox,
+		Text:    "Select the prime numbers",
+		Choices: []extractor.Choice{{Label: "A", Text: "two prime"}, {Label: "B", Text: "four composite"}, {Label: "C", Text: "three prime"}},
+	}
+	result, err := SolveWeb(q, []Evidence{{Passage: "two prime and three prime are supported answers"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Join(result.Values, ",") != "A,C" {
+		t.Fatalf("expected multiple checkbox values A,C; got %+v", result.Values)
 	}
 }

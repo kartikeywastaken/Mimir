@@ -21,9 +21,9 @@ laya:
   python: "python3"  # python bin for scripts/laya_solve.py
 
 solver:
-  enable_background_search: true  # hidden tab Google research (no focus switch) — feeds into Laya state
-  max_search_results: 5
-  confidence_auto_mark_threshold: 92
+  # Web research is mode-controlled and always runs in the isolated browser on port 9223.
+  adaptive_search_pages: 3
+  low_confidence_threshold: 70
 
 overlay:
   position: "top-right"

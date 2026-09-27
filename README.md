@@ -1,20 +1,28 @@
 # Mimir — Laya Browser Auto-Answer Finder
 
-> **Mimir** (Norse wisdom) — sees the question, thinks on-device with Laya, whispers the answer. Never switches your tab. No OpenAI key.
+> **Mimir** (Norse wisdom) — extracts form questions, solves them with local Laya, an isolated research browser, or both, and fills verified answers. It never submits the form.
 
 ```
 Question visible in browser
         ↓
-Agent extracts question + choices  (via laya-browser snapshot or Von CDP, DOM scan)
+Mimir extracts questions and stable input targets via CDP
         ↓
-Laya typed-decision model runs locally (~5ms ANE / ~15ms MLX, no API key)
+Local, Web, or Hybrid pipeline obtains a real answer
         ↓
-Overlay shows:  Suggested answer: B  |  Reason: Laya laya-coreml (92%)  |  Confidence: 92%
+Mimir fills the matching field and verifies its DOM value
         ↓
-YOU choose — or auto-mark if confident
+Mimir advances through safe Next controls and stops before Submit
 ```
 
-Recursive background search: Mimir spawns a **hidden tab** to google/research in parallel without ever stealing focus (`Target.createTarget` without `activate`), feeds snippets into Laya's `state` (up to 96/512/1024 tokens depending on model).
+Web research runs in a separate headless Chromium process on port `9223`. Search tabs and source pages never open in the quiz browser on port `9222`.
+
+### Solving modes
+
+- **Local:** Laya handles selectable answers. Short-answer and paragraph fields use the isolated browser because Laya's typed-decision model does not generate free text. Local failures fall back to Web.
+- **Web:** Browser evidence answers every supported field; selectable questions fall back to Laya when research cannot resolve them.
+- **Hybrid:** The browser gathers evidence and Laya selects or validates selectable answers. A valid result from either component can be used if the other fails.
+
+Mimir supports radio buttons, multi-select checkboxes, dropdowns, short answers, and paragraphs. Low-confidence real answers are filled and flagged. If no real answer can be obtained or the DOM write cannot be verified, the field is left unchanged and reported as unresolved. Mock answers are never written.
 
 Built in **Go** + **Bubble Tea** TUI + **Gum**.
 
@@ -35,7 +43,7 @@ Built in **Go** + **Bubble Tea** TUI + **Gum**.
 - `layaForWeb` **≠** `laya-coreml` — different ports (ONNX vs CoreML). Vishal's site runs the English model in the browser; mizorewww's runs on ANE.
 - `laya-browser` **uses** `laya-mlx` (mizorewww's MLX port) under the hood to resolve English selectors like `click "log in"` locally, with no LLM token cost. It's an `agent-browser` drop-in.
 
-**Mimir uses `laya-browser`'s idea but for quiz solving:** instead of `choice` over snapshot elements, we do `choice` over answer options. Solver at `internal/laya/client.go:1` tries `laya-coreml` first (fastest on Apple Silicon), falls back to `laya-mlx` (same as laya-browser), falls back to mock. **No OpenAI key needed** — see `scripts/laya_solve.py:1`.
+**Mimir uses `laya-browser`'s idea but for form solving:** instead of `choice` over snapshot elements, it performs typed decisions over answer options. The solver tries `laya-coreml` first and then `laya-mlx`. If neither real model is available, it returns an error and uses the configured Web fallback; it never fabricates a mock choice. **No OpenAI key is needed.**
 
 ---
 
@@ -102,12 +110,19 @@ cp config.yaml.example config.yaml
 
 | Key | Action |
 |-----|--------|
-| `e` | Extract question + choices from active tab (CDP or snapshot) |
-| `s` | Solve via **Laya local** (+ background search) |
-| `o` | Toggle overlay on page (no tab switch) |
-| `a` | Auto mode: extract → search → solve → overlay (loop) |
-| `g` | Toggle background Google research (hidden tab) |
+| `e` | Extract and solve questions from the active form page |
+| `s` | Re-solve the current page using the active mode |
+| `a` | Toggle automatic extraction polling |
+| `m` | Choose solving mode |
+| `b` | Choose browser |
+| `/` | Open the command composer |
 | `q` / `ctrl+c` | Quit |
+
+Mimir uses the terminal's configured typeface and works best with a modern
+monospace font that includes Unicode runes. Set `MIMIR_ASCII=1` to use the
+plain `Mimir` wordmark when the rune glyph is unavailable. The fullscreen TUI
+runs in the terminal's alternate screen and restores normal terminal behavior
+when it exits. The selected mode is persisted in the OS user-config directory.
 
 ## Architecture
 
@@ -115,23 +130,22 @@ cp config.yaml.example config.yaml
 cmd/mimir/main.go:1            → entry, bubbletea, laya.New() (no OpenAI)
 internal/laya/client.go:1      → Go → Python bridge to laya-coreml/mlx (same model as laya-browser)
 scripts/laya_solve.py:1        → Python: agent.predict(state, {"q": {"type":"choice", "criteria":[...]}})
-internal/solver/solver.go:1    → Builds Laya state (question + hidden-tab snippets) → calls laya
-internal/von/client.go:1       → CDP: ListTargets, CreateBackgroundTab (hidden), Evaluate, InjectOverlay
-internal/extractor/extractor.go:1 → DOM heuristics (radio, data-testid, etc.)
-internal/overlay/overlay.go:1  → JS floating card
-internal/tui/app.go:1          → Bubble Tea model (idle → extracting → Laya solving → done)
+internal/solver/solver.go:1    → Local/Web/Hybrid decisions and structured answers
+internal/von/client.go:1       → isolated adaptive web research via CDP
+internal/extractor/extractor.go:1 → DOM extraction and stable target stamping
+internal/extractor/fill.go:1   → type-aware filling, readback verification, safe Next
+internal/tui/app.go:1          → fullscreen workflow, fallbacks, progress, summaries
 ```
 
-**How Laya solving works (vs OpenAI before):**
-Before: `question + choices + search snippets → OpenAI gpt-4o-mini → JSON`. Now: `state=question + snippets, criteria=choices → Laya choice → label + confidence`. No network, no key. Tournament for >32 options (like laya-browser's chunking at `laya_browser.py:18`).
+**How Laya solving works:** `state=question + optional evidence, criteria=choices → Laya choice → label + confidence`. Checkbox options are evaluated independently so multiple values can be selected. Laya inference is local and needs no API key.
 
-**How Recursive Background Search works (kept):**
-1. `von.CreateBackgroundTab("https://google.com/search?q=...")` — not activated
-2. Poll `Runtime.evaluate` until results
-3. Close tab, feed snippets into Laya `state`
-4. User never sees tab switch
+**How adaptive research works:**
+1. Start or reuse a dedicated headless browser on port `9223`.
+2. Read search-result evidence, falling back between supported search engines.
+3. For weak, ambiguous, or long-form evidence, inspect up to three public result pages.
+4. Close research tabs and return structured title, URL, and passage evidence.
 
-This mirrors `layaForWeb`'s 100% local inference — nothing you type leaves the machine — but now for quiz answers.
+Web and Hybrid modes—and Local mode for free-text fields or fallback—send the question text to public search services. The quiz browser is never used for this traffic.
 
 ## Customizing
 
@@ -150,5 +164,4 @@ Go 1.27 on APFS `F_PREALLOCATE` fails with `EILSEQ` for binaries >=5M (`outbuf_d
 - [ ] layaForWeb WASM hidden-tab alternative for non-Apple Silicon
 
 ---
-Built for research — you choose the final answer, Laya just whispers locally.
-# Mimir
+Mimir fills answers for review; the user always controls final submission.

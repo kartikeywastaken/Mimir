@@ -73,7 +73,7 @@ def load_agent():
         if agent is not None:
             print(f"laya: using laya-mlx {mlx_model}", file=sys.stderr)
             return agent, "laya-mlx", 1024
-        print("laya-mlx model unavailable, falling back to mock solver", file=sys.stderr)
+        print("laya-mlx model unavailable", file=sys.stderr)
         return None, "none", 0
     except ImportError as e:
         print(f"neither laya-coreml nor laya-mlx installed: {e}", file=sys.stderr)
@@ -110,15 +110,7 @@ def solve_one(data):
 
     agent, kind, limit = get_agent()
     if agent is None:
-        # Mock fallback — deterministic, no model needed
-        # Prefer B for demo, but respect "not" heuristic
-        ans = "B" if len(choices) >= 2 else (choices[0].get("label") if choices else "A")
-        if "not" in state.lower():
-            # pick longest
-            longest = max(choices, key=lambda c: len(c.get("text","")))
-            ans = longest.get("label", ans)
-        print("laya: mock fallback (no model installed)", file=sys.stderr)
-        return {"choice": ans, "answer": ans, "confidence": 0.62, "mock": True, "backend": "mock"}
+        return {"error": "no Laya model is installed or loadable"}
 
     # Truncate to fit token limits
     # layaForWeb: 192 tokens per option, 512 state
@@ -152,9 +144,7 @@ def solve_one(data):
                     label = lbl
                     break
         if not label:
-            # fallback: parse first char or default to first choice
-            stripped = choice_text.strip()
-            label = stripped[:1].upper() if stripped else (choices[0].get("label", "A") if choices else "A")
+            return {"error": f"Laya returned an unmapped choice: {choice_text!r}"}
         # Clamp confidence 0.5-5.0 temperature already handled by laya-coreml shim
         return {
             "choice": choice_text,

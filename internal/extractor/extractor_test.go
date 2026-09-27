@@ -92,3 +92,41 @@ func TestMarkAnswerJS(t *testing.T) {
 		t.Errorf("expected bubbling change event dispatch in JS: %s", js)
 	}
 }
+
+func TestFillAnswerJSUsesStructuredValuesAndReadback(t *testing.T) {
+	q := Question{
+		Index: 2, TargetID: "mimir-q-2", Type: TypeCheckbox,
+		Choices: []Choice{{Label: "A", Text: "Alpha"}, {Label: "C", Text: "Gamma"}},
+	}
+	js := FillAnswerJS(q, []string{"A", "C"})
+	for _, expected := range []string{`"values":["A","C"]`, "answer readback mismatch", "request.type === 'checkbox'"} {
+		if !strings.Contains(js, expected) {
+			t.Fatalf("structured fill script missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"requestSubmit", ".submit("} {
+		if strings.Contains(js, forbidden) {
+			t.Fatalf("fill script must never submit forms; found %q", forbidden)
+		}
+	}
+}
+
+func TestAdvancePageJSRejectsFinalActions(t *testing.T) {
+	for _, expected := range []string{"nextLabels", "submit|send|finish|done|complete|turn in", "no safe next control"} {
+		if !strings.Contains(AdvancePageJS, expected) {
+			t.Fatalf("advance script missing safety rule %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"requestSubmit", ".submit("} {
+		if strings.Contains(AdvancePageJS, forbidden) {
+			t.Fatalf("advance script must never submit forms; found %q", forbidden)
+		}
+	}
+}
+
+func TestParseFillResult(t *testing.T) {
+	result, err := ParseFillResult(`"{\"ok\":true,\"values\":[\"B\"]}"`)
+	if err != nil || !result.OK || len(result.Values) != 1 || result.Values[0] != "B" {
+		t.Fatalf("unexpected fill result: result=%+v err=%v", result, err)
+	}
+}

@@ -9,21 +9,27 @@ import (
 type QuestionType string
 
 const (
-	TypeChoice   QuestionType = "choice"
-	TypeText     QuestionType = "text"
-	TypeDropdown QuestionType = "dropdown"
+	TypeChoice    QuestionType = "choice"
+	TypeCheckbox  QuestionType = "checkbox"
+	TypeText      QuestionType = "text"
+	TypeParagraph QuestionType = "paragraph"
+	TypeDropdown  QuestionType = "dropdown"
 )
 
 // Question represents a single question pulled from the visible tab
 type Question struct {
-	Index      int          `json:"index"`
-	Type       QuestionType `json:"type,omitempty"` // "choice", "text", "dropdown"
-	Text       string       `json:"text"`
-	Choices    []Choice     `json:"choices,omitempty"`
-	RawHTML    string       `json:"raw_html,omitempty"`
-	SolvedAns  string       `json:"solved_ans,omitempty"`
-	Confidence int          `json:"confidence,omitempty"`
-	Marked     bool         `json:"marked,omitempty"`
+	Index         int          `json:"index"`
+	TargetID      string       `json:"target_id,omitempty"`
+	Type          QuestionType `json:"type,omitempty"` // "choice", "text", "dropdown"
+	Text          string       `json:"text"`
+	Choices       []Choice     `json:"choices,omitempty"`
+	RawHTML       string       `json:"raw_html,omitempty"`
+	SolvedAns     string       `json:"solved_ans,omitempty"`
+	SolvedValues  []string     `json:"solved_values,omitempty"`
+	Confidence    int          `json:"confidence,omitempty"`
+	Marked        bool         `json:"marked,omitempty"`
+	LowConfidence bool         `json:"low_confidence,omitempty"`
+	SolveError    string       `json:"solve_error,omitempty"`
 }
 
 type Choice struct {
@@ -114,6 +120,7 @@ const ExtractAllJS = `
       promptText = promptText.replace(/\s*\d+\s*points?\s*$/i, '').trim();
 
       const qIdx = questions.length;
+	  const targetID = 'mimir-q-' + qIdx;
 
       // 1. Multiple Choice (radios / checkboxes)
       const choiceInputs = Array.from(card.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')).filter(isQuizInput);
@@ -132,6 +139,7 @@ const ExtractAllJS = `
           const label = String.fromCharCode(65 + cIdx);
 
           inp.setAttribute('data-mimir-q', String(qIdx));
+		  inp.setAttribute('data-mimir-target', targetID);
           inp.setAttribute('data-mimir-opt', label);
           if (lbl) {
             lbl.setAttribute('data-mimir-q', String(qIdx));
@@ -142,7 +150,8 @@ const ExtractAllJS = `
 
         questions.push({
           index: qIdx,
-          type: "choice",
+		  target_id: targetID,
+		  type: choiceInputs.some(inp => inp.type === 'checkbox' || inp.getAttribute('role') === 'checkbox') ? "checkbox" : "choice",
           text: promptText,
           choices: choices
         });
@@ -153,6 +162,7 @@ const ExtractAllJS = `
       const listbox = card.querySelector('[role="listbox"], select');
       if (listbox && visible(listbox)) {
         listbox.setAttribute('data-mimir-q', String(qIdx));
+		listbox.setAttribute('data-mimir-target', targetID);
         const choices = [];
         if (listbox.tagName === 'SELECT') {
           Array.from(listbox.options).forEach((opt) => {
@@ -178,6 +188,7 @@ const ExtractAllJS = `
 
         questions.push({
           index: qIdx,
+		  target_id: targetID,
           type: "dropdown",
           text: promptText,
           choices: choices
@@ -189,9 +200,11 @@ const ExtractAllJS = `
       const textInput = card.querySelector('input[type="text"], input:not([type]), textarea, [role="textbox"]');
       if (textInput && visible(textInput) && isQuizInput(textInput)) {
         textInput.setAttribute('data-mimir-q', String(qIdx));
+		textInput.setAttribute('data-mimir-target', targetID);
         questions.push({
           index: qIdx,
-          type: "text",
+		  target_id: targetID,
+		  type: textInput.tagName === 'TEXTAREA' || textInput.getAttribute('aria-multiline') === 'true' ? "paragraph" : "text",
           text: promptText,
           choices: []
         });
@@ -233,6 +246,7 @@ const ExtractAllJS = `
       }
 
       const qIdx = questions.length;
+	  const targetID = 'mimir-q-' + qIdx;
       const choices = [];
       inputs.forEach((inp, cIdx) => {
         let lbl = inp.closest('label') || (inp.id ? document.querySelector('label[for="' + inp.id + '"]') : null);
@@ -240,16 +254,56 @@ const ExtractAllJS = `
         if (!choiceText) choiceText = inp.value || ('Option ' + (cIdx + 1));
         const label = String.fromCharCode(65 + cIdx);
         inp.setAttribute('data-mimir-q', String(qIdx));
+		inp.setAttribute('data-mimir-target', targetID);
         inp.setAttribute('data-mimir-opt', label);
         choices.push({ label, text: choiceText });
       });
 
       questions.push({
         index: qIdx,
-        type: "choice",
+		target_id: targetID,
+		type: inputs.some(inp => inp.type === 'checkbox' || inp.getAttribute('role') === 'checkbox') ? "checkbox" : "choice",
         text: promptText,
         choices: choices
       });
+    });
+
+    // Flat forms often have labelled text fields and selects without question
+    // card containers. Add any still-unclaimed controls as individual questions.
+    const flatControls = Array.from(document.querySelectorAll('select, textarea, input[type="text"], input:not([type]), [role="textbox"]'))
+      .filter(isQuizInput).filter(el => !el.hasAttribute('data-mimir-q'));
+    flatControls.forEach(control => {
+      let promptText = '';
+      const labelledBy = control.getAttribute('aria-labelledby');
+      const label = control.closest('label') || (control.id ? document.querySelector('label[for="' + control.id + '"]') : null) ||
+        (labelledBy ? document.getElementById(labelledBy) : null);
+      if (label) promptText = text(label);
+      if (!promptText) promptText = control.getAttribute('aria-label') || control.placeholder || '';
+      if (!promptText) {
+        const fieldset = control.closest('fieldset');
+        const legend = fieldset && fieldset.querySelector('legend');
+        if (legend) promptText = text(legend);
+      }
+      if (!promptText) promptText = 'Question ' + (questions.length + 1);
+
+      const qIdx = questions.length;
+      const targetID = 'mimir-q-' + qIdx;
+      control.setAttribute('data-mimir-q', String(qIdx));
+      control.setAttribute('data-mimir-target', targetID);
+
+      if (control.tagName === 'SELECT') {
+        const choices = [];
+        Array.from(control.options).forEach(opt => {
+          const optionText = (opt.text || opt.value || '').trim();
+          if (optionText && !/choose|select/i.test(optionText)) {
+            choices.push({label:String.fromCharCode(65 + choices.length), text:optionText});
+          }
+        });
+        questions.push({index:qIdx, target_id:targetID, type:'dropdown', text:promptText, choices});
+      } else {
+        const paragraph = control.tagName === 'TEXTAREA' || control.getAttribute('aria-multiline') === 'true';
+        questions.push({index:qIdx, target_id:targetID, type:paragraph ? 'paragraph' : 'text', text:promptText, choices:[]});
+      }
     });
   }
 
@@ -407,6 +461,16 @@ func ParseBatchResult(jsonStr string) (*BatchResult, error) {
 
 	for i := range batch.Questions {
 		batch.Questions[i].Index = i
+		if batch.Questions[i].TargetID == "" {
+			batch.Questions[i].TargetID = fmt.Sprintf("mimir-q-%d", i)
+		}
+		if batch.Questions[i].Type == "" {
+			if len(batch.Questions[i].Choices) > 0 {
+				batch.Questions[i].Type = TypeChoice
+			} else {
+				batch.Questions[i].Type = TypeText
+			}
+		}
 		for j := range batch.Questions[i].Choices {
 			if batch.Questions[i].Choices[j].Label == "" {
 				batch.Questions[i].Choices[j].Label = string(rune('A' + j))

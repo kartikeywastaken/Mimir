@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,16 +63,26 @@ func (c *Client) ActiveTarget() (*Target, error) {
 			return nil, err
 		}
 		lastSeen = targets
+		var fallback *Target
 		for _, t := range targets {
 			if t.Type == "page" {
-				return &t, nil
+				candidate := t
+				if fallback == nil {
+					fallback = &candidate
+				}
+				if t.URL != "" && t.URL != "about:blank" && !strings.HasPrefix(t.URL, "chrome://") {
+					return &candidate, nil
+				}
 			}
+		}
+		if fallback != nil {
+			return fallback, nil
 		}
 		if attempt < 2 {
 			time.Sleep(1 * time.Second)
 		}
 	}
-	
+
 	// Create debug string
 	debugInfo := ""
 	for i, t := range lastSeen {
@@ -80,7 +91,7 @@ func (c *Client) ActiveTarget() (*Target, error) {
 	if debugInfo == "" {
 		debugInfo = "No targets returned by browser."
 	}
-	
+
 	return nil, fmt.Errorf("no page target found - is your browser running? Targets seen: %s", debugInfo)
 }
 
@@ -220,11 +231,18 @@ func (c *Client) RemoveOverlay(wsURL string) error {
 	return err
 }
 
-// BackgroundSearch opens a hidden tab, scrapes snippets, closes it.
-// Starts with Google Search; if Google blocks with CAPTCHA or returns empty, automatically switches to Yahoo Search.
-func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string, error) {
+type SearchEvidence struct {
+	Title   string `json:"title,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Passage string `json:"passage"`
+}
+
+// AdaptiveResearch searches in this client's browser process and, when snippets
+// are insufficient, reads up to three result pages. Callers must provide the
+// dedicated search-browser client; the quiz client is never a fallback.
+func (c *Client) AdaptiveResearch(query string, timeout time.Duration) ([]SearchEvidence, error) {
 	if timeout == 0 {
-		timeout = 8 * time.Second
+		timeout = 15 * time.Second
 	}
 	q := fmt.Sprintf("https://www.google.com/search?q=%s", url.QueryEscape(query))
 	t, err := c.CreateBackgroundTab(q)
@@ -242,22 +260,25 @@ func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string
 		}
 		const out = [];
 		const featured = document.querySelector('.hgKElc, [data-attrid="wa:/description"], .kno-rdesc span, .IZ6rdc');
-		if (featured) out.push('FEATURED: ' + featured.innerText.slice(0, 500));
+		if (featured) out.push({title:'Featured answer', url:location.href, passage:featured.innerText.slice(0, 700)});
 		
 		document.querySelectorAll('div.g, div.MjjYud').forEach(d => {
 			if (out.length >= 4) return;
 			const h = d.querySelector('h3');
 			const desc = d.querySelector('.VwiC3b, .IsZvec, [data-sncf]');
-			if (h && desc) out.push(h.innerText + ' — ' + desc.innerText.slice(0, 300));
+			const a = h && h.closest('a');
+			if (h && desc) out.push({title:h.innerText, url:a ? a.href : '', passage:desc.innerText.slice(0, 500)});
 		});
 		return JSON.stringify({ blocked: false, results: out });
 	})()`
 
 	yahooJS := `(function(){
 		const out = [];
-		document.querySelectorAll('div.compText, .compText p, .algo-desc, .dd p').forEach(el => {
-			const t = (el.innerText || '').trim();
-			if (t.length > 20 && !out.includes(t)) out.push(t);
+		document.querySelectorAll('#web .algo, .dd.algo').forEach(el => {
+			const p = el.querySelector('.compText p, .algo-desc, .dd p');
+			const a = el.querySelector('h3 a, a.ac-algo');
+			const t = (p && p.innerText || '').trim();
+			if (t.length > 20) out.push({title:(a && a.innerText || '').trim(), url:(a && a.href || ''), passage:t.slice(0,500)});
 		});
 		return JSON.stringify(out.slice(0, 5));
 	})()`
@@ -270,8 +291,8 @@ func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string
 			res, err := c.Evaluate(t.WebSocketURL, googleJS)
 			if err == nil && len(res) > 2 {
 				var parsed struct {
-					Blocked bool     `json:"blocked"`
-					Results []string `json:"results"`
+					Blocked bool             `json:"blocked"`
+					Results []SearchEvidence `json:"results"`
 				}
 				var inner string
 				if json.Unmarshal([]byte(res), &inner) == nil {
@@ -290,21 +311,21 @@ func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string
 				}
 
 				if len(parsed.Results) > 0 {
-					return parsed.Results, nil
+					return c.enrichEvidence(query, parsed.Results, deadline), nil
 				}
 			}
 		} else {
 			res, err := c.Evaluate(t.WebSocketURL, yahooJS)
 			if err == nil && len(res) > 5 && res != `""` {
-				var arr []string
+				var arr []SearchEvidence
 				var inner string
 				if json.Unmarshal([]byte(res), &inner) == nil {
 					_ = json.Unmarshal([]byte(inner), &arr)
 				} else {
 					_ = json.Unmarshal([]byte(res), &arr)
 				}
-				if len(arr) > 0 && arr[0] != "" {
-					return arr, nil
+				if len(arr) > 0 && arr[0].Passage != "" {
+					return c.enrichEvidence(query, arr, deadline), nil
 				}
 			}
 		}
@@ -313,3 +334,60 @@ func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string
 	return nil, fmt.Errorf("background search timeout")
 }
 
+func (c *Client) enrichEvidence(query string, evidence []SearchEvidence, deadline time.Time) []SearchEvidence {
+	lower := strings.ToLower(query)
+	deep := len(evidence) < 2 || strings.Contains(lower, "explain") || strings.Contains(lower, "describe") || strings.Contains(lower, "why ")
+	if !deep {
+		return evidence
+	}
+	pageJS := `(function(){
+		const parts=[];
+		document.querySelectorAll('article p, main p, [role="main"] p, p').forEach(p=>{
+			const t=(p.innerText||'').trim().replace(/\s+/g,' ');
+			if(t.length>80 && parts.length<4) parts.push(t.slice(0,700));
+		});
+		return JSON.stringify(parts);
+	})()`
+	limit := len(evidence)
+	if limit > 3 {
+		limit = 3
+	}
+	for i := 0; i < limit && time.Now().Before(deadline); i++ {
+		if evidence[i].URL == "" || strings.Contains(evidence[i].URL, "google.com/search") {
+			continue
+		}
+		target, err := c.CreateBackgroundTab(evidence[i].URL)
+		if err != nil {
+			continue
+		}
+		time.Sleep(800 * time.Millisecond)
+		raw, err := c.Evaluate(target.WebSocketURL, pageJS)
+		_ = c.CloseTarget(target.ID)
+		if err != nil {
+			continue
+		}
+		var inner string
+		if json.Unmarshal([]byte(raw), &inner) == nil {
+			raw = inner
+		}
+		var passages []string
+		if json.Unmarshal([]byte(raw), &passages) == nil && len(passages) > 0 {
+			evidence[i].Passage += " " + strings.Join(passages, " ")
+		}
+	}
+	return evidence
+}
+
+// BackgroundSearch is retained for compatibility with callers that only need
+// passage text.
+func (c *Client) BackgroundSearch(query string, timeout time.Duration) ([]string, error) {
+	evidence, err := c.AdaptiveResearch(query, timeout)
+	if err != nil {
+		return nil, err
+	}
+	passages := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		passages = append(passages, item.Passage)
+	}
+	return passages, nil
+}

@@ -156,5 +156,5 @@ func (c *Client) Backend() string {
 	if c.IsAvailable() {
 		return "laya-coreml/mlx (local)"
 	}
-	return "mock (no laya installed)"
+	return "unavailable (no laya installed)"
 }

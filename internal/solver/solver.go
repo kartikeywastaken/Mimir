@@ -11,12 +11,22 @@ import (
 
 // Result from Laya (local, no API key)
 type Result struct {
-	Answer     string `json:"answer"`     // e.g. "B"
-	Confidence int    `json:"confidence"` // 0-100
-	Reason     string `json:"reason"`
-	SearchUsed bool   `json:"search_used"`
-	Backend    string `json:"backend"` // laya-coreml / laya-mlx / mock
-	RawChoice  string `json:"raw_choice,omitempty"`
+	Values        []string   `json:"values"`
+	Answer        string     `json:"answer,omitempty"` // compatibility: first value
+	Confidence    int        `json:"confidence"`
+	Reason        string     `json:"reason"`
+	SearchUsed    bool       `json:"search_used"`
+	Backend       string     `json:"backend"`
+	RawChoice     string     `json:"raw_choice,omitempty"`
+	Evidence      []Evidence `json:"evidence,omitempty"`
+	FallbackPath  string     `json:"fallback_path,omitempty"`
+	LowConfidence bool       `json:"low_confidence,omitempty"`
+}
+
+type Evidence struct {
+	Title   string `json:"title,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Passage string `json:"passage"`
 }
 
 type Config struct {
@@ -40,6 +50,19 @@ func ConfigFromEnv() Config {
 // This mirrors layaForWeb's choice type but runs natively via laya-coreml/mlx.
 // See: https://vishalmysore.github.io/layaForWeb/ (ONNX WASM) vs laya-coreml (CoreML) vs laya-mlx (laya-browser)
 func Solve(q *extractor.Question, searchSnippets []string, cfg Config) (*Result, error) {
+	evidence := make([]Evidence, 0, len(searchSnippets))
+	for _, snippet := range searchSnippets {
+		evidence = append(evidence, Evidence{Passage: snippet})
+	}
+	if len(q.Choices) == 0 {
+		return SolveWeb(q, evidence)
+	}
+	return SolveLocal(q, evidence, cfg)
+}
+
+// SolveLocal makes a real typed decision with Laya. It never returns a mock or
+// default answer. Evidence is optional and is used by Hybrid mode.
+func SolveLocal(q *extractor.Question, evidence []Evidence, cfg Config) (*Result, error) {
 	client := laya.New()
 	if cfg.Model != "" {
 		client.Model = cfg.Model
@@ -47,8 +70,8 @@ func Solve(q *extractor.Question, searchSnippets []string, cfg Config) (*Result,
 
 	// Build state: question + background research (hidden tab, like recursive Von trick)
 	state := q.Text
-	if len(searchSnippets) > 0 {
-		state += "\n\nBackground research (hidden tab):\n" + strings.Join(searchSnippets, "\n---\n")
+	if len(evidence) > 0 {
+		state += "\n\nBackground research (isolated browser):\n" + evidenceText(evidence)
 	}
 	// Truncate for ANE 96-token limit vs 1024 for general
 	// laya client does its own truncation, but we also keep it short
@@ -57,7 +80,11 @@ func Solve(q *extractor.Question, searchSnippets []string, cfg Config) (*Result,
 	}
 
 	if len(q.Choices) == 0 {
-		return solveTextQuestion(q, searchSnippets)
+		return nil, fmt.Errorf("local Laya cannot generate free text")
+	}
+
+	if q.Type == extractor.TypeCheckbox {
+		return solveCheckboxLocal(client, q, state, evidence, cfg)
 	}
 
 	choices := make([]laya.Choice, len(q.Choices))
@@ -67,88 +94,167 @@ func Solve(q *extractor.Question, searchSnippets []string, cfg Config) (*Result,
 
 	resp, err := client.Predict(state, q.Text, choices, cfg.Instructions)
 	if err != nil {
-		// Fallback to mock if Laya not installed or failed — still shows overlay, never blocks
-		return mockSolve(q, searchSnippets, fmt.Sprintf("laya error: %v", err)), nil
+		return nil, fmt.Errorf("laya decision: %w", err)
+	}
+	if resp.Mock || resp.Answer == "" {
+		return nil, fmt.Errorf("laya returned no real answer")
+	}
+	valid := false
+	for _, choice := range q.Choices {
+		if choice.Label == resp.Answer {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return nil, fmt.Errorf("laya returned unknown choice %q", resp.Answer)
 	}
 
 	// Laya confidence is 0-1, convert to 0-100
 	conf := int(resp.Confidence*100 + 0.5)
-	if conf == 0 {
-		conf = 62
-	}
-	// Clamp
+	// Clamp real model confidence without inventing a default.
 	if conf > 98 {
 		conf = 98
 	}
-	if conf < 10 {
-		conf = 10
+	if conf < 1 {
+		conf = 1
 	}
 
 	reason := fmt.Sprintf("Laya %s (%.0f%%) — typed decision over %d options. %s",
 		resp.Backend, resp.Confidence*100, len(choices),
-		map[bool]string{true: "with background search", false: "no search"}[len(searchSnippets) > 0],
+		map[bool]string{true: "with isolated-browser evidence", false: "without web evidence"}[len(evidence) > 0],
 	)
-	if resp.Mock {
-		reason = "Mock (no laya model installed) — install laya-coreml or laya-mlx for real local decisions."
-	}
 
-	return &Result{
+	return normalizeResult(&Result{
+		Values:     []string{resp.Answer},
 		Answer:     resp.Answer,
 		Confidence: conf,
 		Reason:     reason,
-		SearchUsed: len(searchSnippets) > 0,
+		SearchUsed: len(evidence) > 0,
 		Backend:    resp.Backend,
 		RawChoice:  resp.Choice,
-	}, nil
+		Evidence:   evidence,
+	}), nil
 }
 
-func mockSolve(q *extractor.Question, snippets []string, why string) *Result {
-	ans := "A"
-	if len(q.Choices) >= 2 {
-		ans = "B"
-		if strings.Contains(strings.ToLower(q.Text), "not") && len(q.Choices) > 0 {
-			max := 0
-			for _, c := range q.Choices {
-				if len(c.Text) > max {
-					max = len(c.Text)
-					ans = c.Label
-				}
+func solveCheckboxLocal(client *laya.Client, q *extractor.Question, state string, evidence []Evidence, cfg Config) (*Result, error) {
+	selected := make([]string, 0, len(q.Choices))
+	confidence := 100
+	for _, option := range q.Choices {
+		choices := []laya.Choice{{Label: "Y", Text: "Yes, select this option"}, {Label: "N", Text: "No, do not select this option"}}
+		question := fmt.Sprintf("For %q, should %q be selected?", q.Text, option.Text)
+		resp, err := client.Predict(state, question, choices, "Decide whether this individual option is correct. Select Yes only when supported.")
+		if err != nil {
+			return nil, fmt.Errorf("laya checkbox decision for %s failed: %w", option.Label, err)
+		}
+		if resp.Mock || (resp.Answer != "Y" && resp.Answer != "N") {
+			return nil, fmt.Errorf("laya checkbox decision for %s was invalid", option.Label)
+		}
+		if resp.Answer == "Y" {
+			selected = append(selected, option.Label)
+		}
+		optionConfidence := int(resp.Confidence*100 + 0.5)
+		if optionConfidence < confidence {
+			confidence = optionConfidence
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("laya selected no checkbox options")
+	}
+	return normalizeResult(&Result{Values: selected, Confidence: confidence, Reason: "Laya independently evaluated each checkbox option", SearchUsed: len(evidence) > 0, Backend: "laya", Evidence: evidence}), nil
+}
+
+// SolveWeb derives an answer only from real isolated-browser evidence.
+func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
+	if len(evidence) == 0 {
+		return nil, fmt.Errorf("no web evidence found")
+	}
+	passages := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		if strings.TrimSpace(item.Passage) != "" {
+			passages = append(passages, item.Passage)
+		}
+	}
+	if len(passages) == 0 {
+		return nil, fmt.Errorf("web evidence was empty")
+	}
+
+	if len(q.Choices) == 0 {
+		answer := strings.TrimSpace(extractAnswerFromSnippets(q.Text, passages))
+		if answer == "" {
+			return nil, fmt.Errorf("could not extract a text answer from web evidence")
+		}
+		confidence := 76
+		if len(evidence) > 1 {
+			confidence = 84
+		}
+		return normalizeResult(&Result{Values: []string{answer}, Confidence: confidence, Reason: "Answer extracted from isolated-browser evidence", SearchUsed: true, Backend: "web-evidence", Evidence: evidence}), nil
+	}
+
+	corpus := strings.ToLower(strings.Join(passages, " "))
+	type scoredChoice struct {
+		label string
+		score int
+	}
+	scores := make([]scoredChoice, 0, len(q.Choices))
+	for _, choice := range q.Choices {
+		score := evidenceScore(corpus, choice.Text)
+		scores = append(scores, scoredChoice{label: choice.Label, score: score})
+	}
+	best := 0
+	for _, score := range scores {
+		if score.score > best {
+			best = score.score
+		}
+	}
+	if best == 0 {
+		return nil, fmt.Errorf("web evidence did not support any answer option")
+	}
+	values := make([]string, 0, 1)
+	for _, score := range scores {
+		if score.score == best || (q.Type == extractor.TypeCheckbox && score.score*4 >= best*3) {
+			values = append(values, score.label)
+			if q.Type != extractor.TypeCheckbox {
+				break
 			}
 		}
 	}
-	reason := "Mock — no laya model. " + why
-	if len(snippets) > 0 {
-		reason = "Mock with background snippets: " + snippets[0][:min(120, len(snippets[0]))]
+	confidence := 60 + best*5
+	if confidence > 92 {
+		confidence = 92
 	}
-	return &Result{Answer: ans, Confidence: 62, Reason: reason, SearchUsed: len(snippets) > 0, Backend: "mock"}
+	return normalizeResult(&Result{Values: values, Confidence: confidence, Reason: "Answer option matched isolated-browser evidence", SearchUsed: true, Backend: "web-evidence", Evidence: evidence}), nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func normalizeResult(result *Result) *Result {
+	if len(result.Values) > 0 {
+		result.Answer = result.Values[0]
 	}
-	return b
+	result.LowConfidence = result.Confidence < 70
+	return result
 }
 
-func solveTextQuestion(q *extractor.Question, searchSnippets []string) (*Result, error) {
-	if len(searchSnippets) > 0 {
-		ans := extractAnswerFromSnippets(q.Text, searchSnippets)
-		return &Result{
-			Answer:     ans,
-			Confidence: 88,
-			Reason:     "Extracted answer from background Google search snippet",
-			SearchUsed: true,
-			Backend:    "search-extract",
-		}, nil
+func evidenceText(evidence []Evidence) string {
+	parts := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		parts = append(parts, strings.TrimSpace(item.Title+" — "+item.Passage))
 	}
+	return strings.Join(parts, "\n---\n")
+}
 
-	return &Result{
-		Answer:     "Answer for " + q.Text,
-		Confidence: 50,
-		Reason:     "Text input question (no background search snippets)",
-		SearchUsed: false,
-		Backend:    "mock",
-	}, nil
+func evidenceScore(corpus, choice string) int {
+	choice = strings.ToLower(strings.TrimSpace(choice))
+	if choice == "" {
+		return 0
+	}
+	score := strings.Count(corpus, choice) * 4
+	for _, token := range strings.Fields(choice) {
+		token = strings.Trim(token, ".,:;!?()[]{}\"'")
+		if len(token) >= 4 {
+			score += strings.Count(corpus, token)
+		}
+	}
+	return score
 }
 
 func extractAnswerFromSnippets(query string, snippets []string) string {
@@ -257,6 +363,16 @@ func extractAnswerFromSnippets(query string, snippets []string) string {
 	sentences := strings.Split(first, ". ")
 	if len(sentences) > 0 && len(sentences[0]) > 0 {
 		res := strings.TrimSpace(sentences[0])
+		if strings.HasPrefix(qLower, "what ") || strings.HasPrefix(qLower, "which ") || strings.HasPrefix(qLower, "where ") || strings.HasPrefix(qLower, "when ") {
+			for _, sep := range []string{" is ", " was ", " are ", " were "} {
+				if idx := strings.LastIndex(strings.ToLower(res), sep); idx >= 0 {
+					remainder := strings.TrimSpace(res[idx+len(sep):])
+					if len(remainder) > 0 && len(remainder) <= 100 {
+						return strings.Trim(remainder, `"'.,`)
+					}
+				}
+			}
+		}
 		if len(res) > 80 {
 			for _, sep := range []string{" is ", " was ", " — ", ", "} {
 				if idx := strings.Index(res, sep); idx > 0 && idx < 60 {
@@ -273,5 +389,3 @@ func extractAnswerFromSnippets(query string, snippets []string) string {
 
 	return first
 }
-
-
