@@ -39,11 +39,8 @@ func SearchQuestions(v *von.Client, questions []extractor.Question, maxConcurren
 				defer wg.Done()
 
 				query := q.Text
-				for _, c := range q.Choices {
-					query += " " + c.Text
-				}
 
-				snippets, err := v.BackgroundSearch(query, 10*time.Second)
+				snippets, err := v.BackgroundSearch(query, 60*time.Second)
 				results[idx] = SearchResult{
 					QuestionIdx: idx,
 					Query:       query,

@@ -82,14 +82,13 @@ func TestParseBatchResult(t *testing.T) {
 
 func TestMarkAnswerJS(t *testing.T) {
 	js := MarkAnswerJS(1, "B")
-	if !strings.Contains(js, `data-mimir-q="1"`) {
-		t.Errorf("expected selector to contain question index 1: %s", js)
+	for _, want := range []string{`"target_id":"mimir-q-1"`, `"values":["B"]`, "answer readback mismatch"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("legacy fill missing %s", want)
+		}
 	}
-	if !strings.Contains(js, `data-mimir-opt="B"`) {
-		t.Errorf("expected selector to contain option B: %s", js)
-	}
-	if !strings.Contains(js, "dispatchEvent(new Event('change'") {
-		t.Errorf("expected bubbling change event dispatch in JS: %s", js)
+	if strings.Contains(js, "setAttribute('aria-checked'") {
+		t.Fatal("must not forge checked state")
 	}
 }
 

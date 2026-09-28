@@ -33,11 +33,13 @@ func FillAnswerJS(q Question, values []string) string {
 	})
 
 	return fmt.Sprintf(`
-(() => {
+(async () => {
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const visible = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const request = %s;
   const wanted = Array.isArray(request.values) ? request.values.map(String) : [];
   const wantedSet = new Set(wanted);
-  const selector = '[data-mimir-q="' + request.index + '"]';
+  const selector = '[data-mimir-target="' + CSS.escape(request.target_id || ("mimir-q-" + request.index)) + '"]';
   const optionSelector = selector + '[data-mimir-opt]';
   const answerText = value => request.choices[value] || value;
   const fail = error => JSON.stringify({ok:false, error});
@@ -55,6 +57,8 @@ func FillAnswerJS(q Question, values []string) string {
       .filter((el, i, all) => all.indexOf(el) === i);
     if (!controls.length) return fail('answer controls not found');
 
+    if (!wanted.length || wanted.some(value => !controls.some(el => el.getAttribute('data-mimir-opt') === value))) return fail('unknown answer option');
+    if (controls.some(el => el.disabled || el.getAttribute('aria-disabled') === 'true')) return fail('answer controls disabled');
     for (const control of controls) {
       const owner = control.matches('[data-mimir-opt]') ? control : control.closest('[data-mimir-opt]');
       const label = (owner && owner.getAttribute('data-mimir-opt')) || control.getAttribute('data-mimir-opt');
@@ -62,17 +66,13 @@ func FillAnswerJS(q Question, values []string) string {
       const selected = control.checked === true || control.getAttribute('aria-checked') === 'true';
       if (request.type === 'checkbox') {
         if (selected !== shouldSelect) control.click();
-        if ('checked' in control) control.checked = shouldSelect;
-        if (control.hasAttribute('aria-checked')) control.setAttribute('aria-checked', String(shouldSelect));
-        fire(control);
       } else if (shouldSelect && !selected) {
         control.click();
-        if ('checked' in control) control.checked = true;
-        if (control.hasAttribute('aria-checked')) control.setAttribute('aria-checked', 'true');
-        fire(control);
       }
     }
 
+    await pause(200);
+    if (controls.some(control => !control.isConnected)) return fail('answer controls replaced during fill');
     const actual = controls.filter(control => control.checked === true || control.getAttribute('aria-checked') === 'true')
       .map(control => {
         const owner = control.matches('[data-mimir-opt]') ? control : control.closest('[data-mimir-opt]');
@@ -85,27 +85,51 @@ func FillAnswerJS(q Question, values []string) string {
   }
 
   if (request.type === 'dropdown') {
-    const listbox = document.querySelector('[role="listbox"]' + selector + ', select' + selector);
+    const listbox = document.querySelector('[role="listbox"]' + selector + ', [role="combobox"]' + selector + ', select' + selector);
     if (!listbox || wanted.length !== 1) return fail('dropdown not found or invalid answer');
+    if (listbox.disabled || listbox.getAttribute('aria-disabled') === 'true') return fail('dropdown disabled');
     const wantedLabel = wanted[0];
     const wantedText = answerText(wantedLabel).trim();
     if (listbox.tagName === 'SELECT') {
-      const option = Array.from(listbox.options).find(o => o.text.trim() === wantedText || o.value === wantedText);
+      const matches = Array.from(listbox.options).filter(o => o.text.trim() === wantedText);
+      if (matches.length !== 1) return fail('dropdown option missing or ambiguous');
+      const option = matches[0];
       if (!option) return fail('dropdown option not found');
-      listbox.value = option.value;
+      if (option.disabled) return fail('dropdown option disabled');
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(listbox, option.value);
       fire(listbox);
-      return listbox.value === option.value ? pass([wantedLabel]) : fail('dropdown readback mismatch');
+      await pause(200);
+      return listbox.isConnected && listbox.value === option.value ? pass([wantedLabel]) : fail('dropdown readback mismatch');
     }
-    const card = listbox.closest('.Qr7Oae, [role="listitem"]') || listbox.parentElement;
-    const options = Array.from((card || document).querySelectorAll('[role="option"]'));
-    const option = options.find(o => o.getAttribute('data-mimir-opt') === wantedLabel ||
-      (o.getAttribute('data-value') || o.innerText || '').trim() === wantedText);
-    if (!option) return fail('dropdown option not found');
+    const optionText = el => (el.getAttribute('data-value') || el.innerText || el.textContent || '').trim();
+    const options = () => {
+      const ids = (listbox.getAttribute('aria-controls') || listbox.getAttribute('aria-owns') || '').split(/\s+/);
+      return [listbox, ...ids.map(id => document.getElementById(id)).filter(Boolean)]
+        .flatMap(root => Array.from(root.querySelectorAll('[role="option"]')));
+    };
+    listbox.scrollIntoView({block:'center'});
+    listbox.focus();
     listbox.click();
+    let option;
+    for (let i=0; i<25; i++) {
+      option = options().find(el => visible(el) && el.getAttribute('aria-disabled') !== 'true' && optionText(el) === wantedText);
+      if (option) break;
+      await pause(100);
+    }
+    if (!option) return fail('visible dropdown option not found after opening');
     option.click();
-    const selected = option.getAttribute('aria-selected') === 'true' ||
-      (listbox.innerText || '').includes(wantedText);
-    return selected ? pass([wantedLabel]) : fail('dropdown readback mismatch');
+    for (let i=0; i<20; i++) {
+      await pause(100);
+      if (!listbox.isConnected) return fail('dropdown replaced during fill');
+      const selected = options().filter(el => el.getAttribute('aria-selected') === 'true');
+      // Never accept text from the whole listbox: that includes unselected options.
+      const display = listbox.querySelector('[jsname="d9BH4c"]');
+      const displayed = display && (display.innerText || '').trim();
+      if ((selected.length === 1 && optionText(selected[0]) === wantedText) ||
+          (listbox.getAttribute('aria-expanded') !== 'true' && displayed === wantedText) ||
+          (listbox.matches('input') && listbox.value === wantedText && listbox.getAttribute('aria-expanded') === 'false')) return pass([wantedLabel]);
+    }
+    return fail('dropdown readback mismatch');
   }
 
   if (request.type === 'text' || request.type === 'paragraph') {
@@ -113,6 +137,7 @@ func FillAnswerJS(q Question, values []string) string {
     const input = candidate && (candidate.matches('input, textarea, [contenteditable="true"]')
       ? candidate : candidate.querySelector('input, textarea, [contenteditable="true"]'));
     if (!input || wanted.length !== 1) return fail('text field not found or invalid answer');
+    if (input.disabled || input.readOnly || input.getAttribute('aria-disabled') === 'true') return fail('text field disabled');
     const value = wanted[0];
     if (input.isContentEditable) {
       input.textContent = value;
@@ -123,8 +148,9 @@ func FillAnswerJS(q Question, values []string) string {
     }
     fire(input);
     input.dispatchEvent(new Event('blur', {bubbles:true}));
+    await pause(200);
     const actual = input.isContentEditable ? input.textContent : input.value;
-    return actual === value ? pass([actual]) : fail('text readback mismatch');
+    return input.isConnected && actual === value ? pass([actual]) : fail('text readback mismatch');
   }
 
   return fail('unsupported question type');

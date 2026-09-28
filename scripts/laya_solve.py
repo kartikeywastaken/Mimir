@@ -91,6 +91,11 @@ def get_agent():
 
 def solve_one(data):
     state = data.get("state") or data.get("question") or ""
+    question = data.get("question") or ""
+    # Checkbox calls have identical Y/N choices: their individual option must
+    # appear in state, otherwise every option receives the same prediction.
+    if question and question not in state:
+        state = question + "\n\n" + state
     choices = data.get("choices") or []
     instructions = data.get("instructions") or "Which answer correctly answers the question?"
 

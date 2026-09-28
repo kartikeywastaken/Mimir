@@ -19,10 +19,10 @@ Web research runs in a separate headless Chromium process on port `9223`. Search
 ### Solving modes
 
 - **Local:** Laya handles selectable answers. Short-answer and paragraph fields use the isolated browser because Laya's typed-decision model does not generate free text. Local failures fall back to Web.
-- **Web:** Browser evidence answers every supported field; selectable questions fall back to Laya when research cannot resolve them.
-- **Hybrid:** The browser gathers evidence and Laya selects or validates selectable answers. A valid result from either component can be used if the other fails.
+- **Web:** Researches each objective question, reads source pages, and requires corroborating evidence before filling. Unresolved questions stay visible for review.
+- **Hybrid (default for new installs):** Web evidence proposes the answer; Laya checks selectable answers for agreement. Disagreements stay unresolved. If local validation is unavailable, a sufficiently supported web answer can still be used. Missing web evidence never falls back to model memory. Existing saved mode selections are preserved.
 
-Mimir supports radio buttons, multi-select checkboxes, dropdowns, short answers, and paragraphs. Before solving, it classifies fields as objective questions, respondent-owned fields, or non-questions. Personal/profile fields and ambiguous prompts are left untouched. Answers below the 70% safety threshold, missing evidence, and failed DOM writes are also left unchanged. Mock answers are never written.
+Mimir handles native and ARIA radio buttons, multi-select checkboxes, per-row radio/checkbox grids, native selects, ARIA listboxes/comboboxes, short answers, and paragraphs. Custom dropdowns are opened and their visible options clicked; selection is read back after the site updates. Grid rows retain their own prompts and column choices. Before solving, it classifies fields as objective questions, respondent-owned fields, or non-questions. Personal/profile fields and ambiguous prompts are left untouched. Answers below the 70% safety threshold, missing evidence, and failed DOM writes are also left unchanged. Mock answers are never written.
 
 Built in **Go** + **Bubble Tea** TUI + **Gum**.
 
@@ -110,7 +110,7 @@ cp config.yaml.example config.yaml
 
 | Key | Action |
 |-----|--------|
-| `ctrl+p` | Start solving after the form is open and respondent details are filled |
+| `ctrl+p` | Start solving from the attached browser tab or the terminal |
 | `m` | Choose solving mode |
 | `b` | Choose browser |
 | `/` | Open the command composer |
@@ -122,7 +122,7 @@ plain `Mimir` wordmark when the rune glyph is unavailable. The fullscreen TUI
 runs in the terminal's alternate screen and restores normal terminal behavior
 when it exits. The selected mode is persisted in the OS user-config directory.
 Mimir does not begin extracting or solving when the browser opens; it waits for
-`ctrl+p`, then spaces question attempts by two seconds.
+`ctrl+p`, then spaces question attempts by two seconds. The browser shortcut is installed while Mimir is running, including on newly opened or navigated tabs (allow about a second). It starts control of the tab receiving the shortcut; switching tabs during research does not redirect answer writes. It is a browser-page shortcut, not an OS-wide hotkey; browser-internal pages and cross-origin iframe keyboard events are not supported. Open an embedded form directly if needed.
 
 The centered UI includes a compact decision trace showing classification,
 pipeline/backend, evidence sources, confidence, fallbacks, verified fills, and
@@ -146,15 +146,18 @@ internal/tui/app.go:1          → fullscreen workflow, fallbacks, progress, sum
 
 **How adaptive research works:**
 1. Start or reuse a dedicated headless browser on port `9223`.
-2. Read search-result evidence, falling back between supported search engines.
-3. For weak, ambiguous, or long-form evidence, inspect up to three public result pages.
-4. Close research tabs and return structured title, URL, and passage evidence.
+2. Search Google, with Bing, DuckDuckGo, and Yahoo fallbacks for empty or blocked results.
+3. Wait for source pages to load and read up to four public result pages; each research attempt has a 60-second budget. Weak answers trigger another focused lookup.
+4. Match subject-specific passages and whole answer terms, including one-letter symbols. Require support from two distinct source hosts before automatic Web/Hybrid filling. Repeated pages from one host do not raise confidence.
+5. Close research tabs and return structured title, URL, and passage evidence.
+
+These evidence scores are conservative rules, not calibrated probabilities. Semantic paraphrases, ambiguous questions, inaccessible pages, closed shadow roots, and unsupported custom widgets can remain unresolved. Universal site compatibility is still a work in progress. Hybrid uses the larger Core ML context variant for evidence when the default ANE model would otherwise be used; an explicit configured model remains respected.
 
 Web and Hybrid modes—and Local mode for free-text fields or fallback—send the question text to public search services. The quiz browser is never used for this traffic.
 
 ## Customizing
 
-- Add site selectors in `internal/extractor/extractor.go:10`
+- Add or refine extraction logic in `internal/extractor/extract.js`
 - Change Laya instructions in `config.yaml` or `internal/solver/solver.go:24`
 - For `layaForWeb` in-browser mode, load `https://vishalmysore.github.io/layaForWeb/` in a hidden laya-browser tab and post via `Runtime.evaluate` — Mimir's Go solver already truncates to its 512/192 limits.
 
@@ -170,3 +173,14 @@ Go 1.27 on APFS `F_PREALLOCATE` fails with `EILSEQ` for binaries >=5M (`outbuf_d
 
 ---
 Mimir fills answers for review; the user always controls final submission.
+
+## Regression checks
+
+```sh
+go test ./...
+python3 -B scripts/test_laya_solve.py
+# Point at a dedicated test Chromium instance, never your regular browser:
+MIMIR_TEST_CDP=http://127.0.0.1:9334 go test ./internal/extractor -run TestBrowserFormControls -v
+```
+
+The browser fixture checks row isolation, native selects, delayed portal dropdowns, unchanged/inert controls, stale targets, and shortcut routing. Optional `MIMIR_TEST_FORM` enables read-only extraction of a public form; `MIMIR_TEST_RESEARCH_CDP` enables a live search smoke test. Tests never submit forms.

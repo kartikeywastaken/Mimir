@@ -261,3 +261,19 @@ func TestStepByStepSolving(t *testing.T) {
 		t.Fatalf("expected run to stop before submission, got state=%v summary=%q", model.state, model.summaryLine)
 	}
 }
+
+func TestNewInstallDefaultsToHybrid(t *testing.T) {
+	t.Setenv("MIMIR_CONFIG_DIR", t.TempDir())
+	if loadPersistedMode() != ModeHybrid {
+		t.Fatal("new installs must default to web-first hybrid")
+	}
+}
+
+func TestUnresolvedPageStaysForReview(t *testing.T) {
+	m := sizedModel(t, 100, 30)
+	m.questions = []extractor.Question{{Text: "What is the answer?"}}
+	updated, cmd := m.Update(questionStepSolvedMsg{Index: 0, Total: 1, Err: fmt.Errorf("conflicting sources")})
+	if updated.(Model).state != StateDone || cmd != nil {
+		t.Fatal("unresolved page must not advance")
+	}
+}

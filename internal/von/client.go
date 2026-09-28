@@ -1,6 +1,7 @@
 package von
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ type Client struct {
 	HTTPBase string // e.g. http://127.0.0.1:9222
 	mu       sync.Mutex
 	nextID   int
+	targetID string
 }
 
 func New(httpBase string) *Client {
@@ -41,7 +43,7 @@ type Target struct {
 
 // ListTargets GET /json
 func (c *Client) ListTargets() ([]Target, error) {
-	resp, err := http.Get(c.HTTPBase + "/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(c.HTTPBase + "/json")
 	if err != nil {
 		return nil, fmt.Errorf("browser not reachable at %s: %w", c.HTTPBase, err)
 	}
@@ -64,6 +66,26 @@ func (c *Client) ActiveTarget() (*Target, error) {
 			return nil, err
 		}
 		lastSeen = targets
+		c.mu.Lock()
+		pinned := c.targetID
+		c.mu.Unlock()
+		if pinned != "" {
+			for _, target := range targets {
+				if target.ID == pinned {
+					return &target, nil
+				}
+			}
+			return nil, fmt.Errorf("the controlled tab was closed")
+		}
+		for _, target := range targets {
+			if target.Type != "page" {
+				continue
+			}
+			visible, err := c.Evaluate(target.WebSocketURL, `document.visibilityState === 'visible'`)
+			if err == nil && visible == "true" {
+				return &target, nil
+			}
+		}
 		var fallback *Target
 		for _, t := range targets {
 			if t.Type == "page" {
@@ -239,149 +261,141 @@ type SearchEvidence struct {
 }
 
 // AdaptiveResearch searches in this client's browser process and, when snippets
-// are insufficient, reads up to three result pages. Callers must provide the
+// are available, reads up to four result pages. Callers must provide the
 // dedicated search-browser client; the quiz client is never a fallback.
 func (c *Client) AdaptiveResearch(query string, timeout time.Duration) ([]SearchEvidence, error) {
-	if timeout == 0 {
-		timeout = 15 * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
 	}
-	q := fmt.Sprintf("https://www.google.com/search?q=%s", url.QueryEscape(query))
-	t, err := c.CreateBackgroundTab(q)
-	if err != nil {
-		return nil, err
-	}
-	defer c.CloseTarget(t.ID)
-
-	// wait for initial page load
-	time.Sleep(1500 * time.Millisecond)
-
-	googleJS := `(function(){
-		if (window.location.href.includes('google.com/sorry')) {
-			return JSON.stringify({ blocked: true });
-		}
-		const out = [];
-		const featured = document.querySelector('.hgKElc, [data-attrid="wa:/description"], .kno-rdesc span, .IZ6rdc');
-		if (featured) out.push({title:'Featured answer', url:location.href, passage:featured.innerText.slice(0, 700)});
-		
-		document.querySelectorAll('div.g, div.MjjYud').forEach(d => {
-			if (out.length >= 4) return;
-			const h = d.querySelector('h3');
-			const desc = d.querySelector('.VwiC3b, .IsZvec, [data-sncf]');
-			const a = h && h.closest('a');
-			if (h && desc) out.push({title:h.innerText, url:a ? a.href : '', passage:desc.innerText.slice(0, 500)});
-		});
-		return JSON.stringify({ blocked: false, results: out });
-	})()`
-
-	yahooJS := `(function(){
-		const out = [];
-		document.querySelectorAll('#web .algo, .dd.algo').forEach(el => {
-			const p = el.querySelector('.compText p, .algo-desc, .dd p');
-			const a = el.querySelector('h3 a, a.ac-algo');
-			const t = (p && p.innerText || '').trim();
-			if (t.length > 20) out.push({title:(a && a.innerText || '').trim(), url:(a && a.href || ''), passage:t.slice(0,500)});
-		});
-		return JSON.stringify(out.slice(0, 5));
-	})()`
-
-	switchedToYahoo := false
 	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		if !switchedToYahoo {
-			res, err := c.Evaluate(t.WebSocketURL, googleJS)
-			if err == nil && len(res) > 2 {
-				var parsed struct {
-					Blocked bool             `json:"blocked"`
-					Results []SearchEvidence `json:"results"`
+	engines := []struct{ url, script string }{
+		{"https://www.google.com/search?q=" + url.QueryEscape(query), `(() => {
+   const results=[];
+   document.querySelectorAll('div.MjjYud, div.g').forEach(el=>{
+    const h=el.querySelector('h3'), a=h && h.closest('a'), p=el.querySelector('.VwiC3b, .IsZvec, [data-sncf]');
+    if(a && p) results.push({title:h.innerText,url:a.href,passage:p.innerText});
+   }); return JSON.stringify(results);
+  })()`},
+		{"https://www.bing.com/search?q=" + url.QueryEscape(query), `JSON.stringify(Array.from(document.querySelectorAll('#b_results .b_algo')).map(el=>({title:el.querySelector('h2')?.innerText || '',url:el.querySelector('h2 a')?.href || '',passage:el.querySelector('.b_caption p, p, .b_caption, .b_snippet, .b_lineclamp2, .b_lineclamp3')?.innerText || ''})))`},
+		{"https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query), `JSON.stringify(Array.from(document.querySelectorAll('.result')).map(el=>({title:el.querySelector('.result__a')?.innerText || '',url:el.querySelector('.result__a')?.href || '',passage:el.querySelector('.result__snippet')?.innerText || ''})))`},
+		{"https://search.yahoo.com/search?p=" + url.QueryEscape(query), `JSON.stringify(Array.from(document.querySelectorAll('#web .algo, .dd.algo')).map(el=>({title:el.querySelector('h3')?.innerText || '',url:el.querySelector('h3 a, a.ac-algo')?.href || '',passage:el.querySelector('.compText p, .algo-desc, .dd p')?.innerText || ''})))`},
+	}
+	var evidence []SearchEvidence
+	seen := map[string]bool{}
+	for _, engine := range engines {
+		if !time.Now().Before(deadline) {
+			break
+		}
+		target, err := c.CreateBackgroundTab(engine.url)
+		if err != nil {
+			continue
+		}
+		engineDeadline := time.Now().Add(8 * time.Second)
+		initialCount := len(evidence)
+		for time.Now().Before(engineDeadline) && time.Now().Before(deadline) {
+			raw, err := c.Evaluate(target.WebSocketURL, engine.script)
+			var results []SearchEvidence
+			if err == nil && json.Unmarshal([]byte(raw), &results) == nil {
+				for _, item := range results {
+					item.URL = sourceURL(item.URL)
+					if item.URL == "" || seen[item.URL] || strings.TrimSpace(item.Passage) == "" {
+						continue
+					}
+					seen[item.URL] = true
+					evidence = append(evidence, item)
 				}
-				var inner string
-				if json.Unmarshal([]byte(res), &inner) == nil {
-					_ = json.Unmarshal([]byte(inner), &parsed)
-				} else {
-					_ = json.Unmarshal([]byte(res), &parsed)
-				}
-
-				if parsed.Blocked || (time.Since(deadline.Add(-timeout)) > 3*time.Second && len(parsed.Results) == 0) {
-					// Google blocked by captcha or empty - switch to Yahoo
-					yahooURL := fmt.Sprintf("https://search.yahoo.com/search?p=%s", url.QueryEscape(query))
-					_, _ = c.Evaluate(t.WebSocketURL, fmt.Sprintf("window.location.href = %q;", yahooURL))
-					switchedToYahoo = true
-					time.Sleep(1500 * time.Millisecond)
-					continue
-				}
-
-				if len(parsed.Results) > 0 {
-					return c.enrichEvidence(query, parsed.Results, deadline), nil
+				if len(evidence)-initialCount >= 3 {
+					break
 				}
 			}
-		} else {
-			res, err := c.Evaluate(t.WebSocketURL, yahooJS)
-			if err == nil && len(res) > 5 && res != `""` {
-				var arr []SearchEvidence
-				var inner string
-				if json.Unmarshal([]byte(res), &inner) == nil {
-					_ = json.Unmarshal([]byte(inner), &arr)
-				} else {
-					_ = json.Unmarshal([]byte(res), &arr)
-				}
-				if len(arr) > 0 && arr[0].Passage != "" {
-					return c.enrichEvidence(query, arr, deadline), nil
-				}
+			time.Sleep(300 * time.Millisecond)
+		}
+		_ = c.CloseTarget(target.ID)
+		if len(evidence) >= 3 {
+			break
+		}
+	}
+	if len(evidence) == 0 {
+		return nil, fmt.Errorf("no search evidence: providers blocked, empty, or timed out")
+	}
+	sort.SliceStable(evidence, func(a, b int) bool {
+		return passageRelevance(query, evidence[a].Title+" "+evidence[a].Passage) > passageRelevance(query, evidence[b].Title+" "+evidence[b].Passage)
+	})
+	return c.enrichEvidence(query, evidence, deadline), nil
+}
+
+// Resolve public search redirects before attributing or opening source pages.
+func sourceURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	if strings.HasSuffix(u.Hostname(), "google.com") && u.Path == "/url" {
+		if q := u.Query().Get("q"); q != "" {
+			return sourceURL(q)
+		}
+	}
+	if strings.HasSuffix(u.Hostname(), "search.yahoo.com") {
+		if start := strings.Index(u.EscapedPath(), "/RU="); start >= 0 {
+			value := strings.Split(u.EscapedPath()[start+4:], "/RK=")[0]
+			if decoded, err := url.PathUnescape(value); err == nil {
+				return sourceURL(decoded)
 			}
 		}
-		time.Sleep(700 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("background search timeout")
+	if strings.HasSuffix(u.Hostname(), "bing.com") && u.Path == "/ck/a" {
+		encoded := strings.TrimPrefix(u.Query().Get("u"), "a1")
+		if decoded, err := base64.RawURLEncoding.DecodeString(encoded); err == nil {
+			return sourceURL(string(decoded))
+		}
+	}
+	if strings.HasSuffix(u.Hostname(), "duckduckgo.com") {
+		if target := u.Query().Get("uddg"); target != "" {
+			return sourceURL(target)
+		}
+	}
+	u.Fragment = ""
+	return u.String()
 }
 
 func (c *Client) enrichEvidence(query string, evidence []SearchEvidence, deadline time.Time) []SearchEvidence {
-	lower := strings.ToLower(query)
-	deep := len(evidence) < 2 || strings.Contains(lower, "explain") || strings.Contains(lower, "describe") ||
-		strings.Contains(lower, "why ") || strings.Contains(lower, "select all") || strings.HasPrefix(lower, "which ")
-	if !deep {
-		return evidence
-	}
-	pageJS := `(function(){
-		const parts=[];
-		document.querySelectorAll('article p, main p, [role="main"] p, p').forEach(p=>{
-			const t=(p.innerText||'').trim().replace(/\s+/g,' ');
-			if(t.length>80 && parts.length<30) parts.push(t.slice(0,700));
-		});
-		return JSON.stringify(parts);
-	})()`
+	pageJS := `(() => {
+  if(document.readyState==='loading') return '[]';
+  const parts=[];
+  document.querySelectorAll('article p, main p, [role="main"] p, p').forEach(p=>{
+   const t=(p.innerText||'').trim().replace(/\s+/g,' ');
+   if(t.length>25 && parts.length<150)parts.push(t.slice(0,1500));
+  });return JSON.stringify(parts);
+ })()`
 	limit := len(evidence)
-	if limit > 3 {
-		limit = 3
+	if limit > 4 {
+		limit = 4
 	}
 	for i := 0; i < limit && time.Now().Before(deadline); i++ {
-		if evidence[i].URL == "" || strings.Contains(evidence[i].URL, "google.com/search") {
-			continue
-		}
 		target, err := c.CreateBackgroundTab(evidence[i].URL)
 		if err != nil {
 			continue
 		}
-		time.Sleep(800 * time.Millisecond)
-		raw, err := c.Evaluate(target.WebSocketURL, pageJS)
+		pageDeadline := time.Now().Add(6 * time.Second)
+		var passages []string
+		for time.Now().Before(pageDeadline) && time.Now().Before(deadline) {
+			raw, err := c.Evaluate(target.WebSocketURL, pageJS)
+			if err == nil && json.Unmarshal([]byte(raw), &passages) == nil && len(passages) > 0 {
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
 		_ = c.CloseTarget(target.ID)
-		if err != nil {
+		if len(passages) == 0 {
 			continue
 		}
-		var inner string
-		if json.Unmarshal([]byte(raw), &inner) == nil {
-			raw = inner
+		sort.SliceStable(passages, func(a, b int) bool {
+			return passageRelevance(query, passages[a]) > passageRelevance(query, passages[b])
+		})
+		if len(passages) > 4 {
+			passages = passages[:4]
 		}
-		var passages []string
-		if json.Unmarshal([]byte(raw), &passages) == nil && len(passages) > 0 {
-			sort.SliceStable(passages, func(a, b int) bool {
-				return passageRelevance(query, passages[a]) > passageRelevance(query, passages[b])
-			})
-			if len(passages) > 4 {
-				passages = passages[:4]
-			}
-			evidence[i].Passage += " " + strings.Join(passages, " ")
-		}
+		evidence[i].Passage = strings.Join(passages, "\n")
 	}
 	return evidence
 }

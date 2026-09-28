@@ -206,6 +206,11 @@ func (m Model) Init() tea.Cmd {
 }
 
 // Messages
+type shortcutPollMsg struct {
+	targetID string
+	client   *von.Client
+}
+
 type tickMsg time.Time
 type pollMsg time.Time
 type browserLaunchedMsg struct {
@@ -249,7 +254,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusDetail = "Ctrl+P to start"
 		m.log("Ready. Fill respondent details, then press Ctrl+P to solve.")
 		m.traceEvent("WAIT", "Fill respondent details, then press Ctrl+P")
-		return m, m.spinner.Tick
+		return m, tea.Batch(m.spinner.Tick, pollShortcutCmd(m.von))
+
+	case shortcutPollMsg:
+		if msg.client != m.von {
+			return m, nil
+		}
+		next := pollShortcutCmd(m.von)
+		if msg.targetID != "" && (m.state == StateWaitingForStart || m.state == StateDone || m.state == StateIdle || m.state == StateError) {
+			m.von.PinTarget(msg.targetID)
+			updated, cmd := m.handleKeyPress(tea.KeyMsg{Type: tea.KeyCtrlP})
+			return updated, tea.Batch(cmd, next)
+		}
+		return m, next
 
 	case batchExtractedMsg:
 		if msg.err != nil {
@@ -358,6 +375,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 
+		// Keep unresolved objective answers visible for review before navigation.
+		for _, question := range m.questions {
+			if !question.Marked && !question.Skipped {
+				m.finishRun("unresolved answers remain on this page")
+				return m, nil
+			}
+		}
 		// This page is complete. Advance only through an explicitly safe Next control.
 		m.state = StateAdvancing
 		m.lastSolvedFingerprint = makeFingerprint(m.questions)
@@ -395,6 +419,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlP && m.von != nil && (m.state == StateWaitingForStart || m.state == StateDone || m.state == StateIdle || m.state == StateError) {
+			m.von.PinTarget("")
+		}
 		return m.handleKeyPress(msg)
 
 	case tea.MouseMsg:
@@ -901,7 +928,7 @@ func (m Model) renderMinimalCommands(width int) string {
 }
 
 func (m Model) renderMinimalModes(width int) string {
-	options := []string{"Local AI · Laya; web fallback for text", "Web Search · isolated browser evidence", "Hybrid · web evidence validated by Laya"}
+	options := []string{"Local AI · Laya; web fallback for text", "Web Search · isolated browser evidence", "Hybrid · web first, Laya checks agreement"}
 	lines := []string{minimalPanelLine("Choose a solving mode", width, false, colorSubPurple)}
 	for index, option := range options {
 		selected := index == m.selectedMode
@@ -1137,15 +1164,15 @@ func settingsPath() string {
 func loadPersistedMode() SolveMode {
 	path := settingsPath()
 	if path == "" {
-		return ModeLocalAI
+		return ModeHybrid
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ModeLocalAI
+		return ModeHybrid
 	}
 	var settings persistedSettings
 	if json.Unmarshal(data, &settings) != nil || settings.Mode < ModeLocalAI || settings.Mode > ModeHybrid {
-		return ModeLocalAI
+		return ModeHybrid
 	}
 	return settings.Mode
 }
@@ -1217,7 +1244,18 @@ func extractBatchCmd(v *von.Client) tea.Cmd {
 		if err != nil {
 			return batchExtractedMsg{nil, err}
 		}
-		res, err := v.Evaluate(t.WebSocketURL, extractor.ExtractAllJS)
+		v.PinTarget(t.ID)
+		var res string
+		for attempt := 0; attempt < 3; attempt++ {
+			res, err = v.Evaluate(t.WebSocketURL, extractor.ExtractAllJS)
+			if err == nil {
+				break
+			}
+			if !strings.Contains(err.Error(), "context") {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
 		if err != nil {
 			return batchExtractedMsg{nil, err}
 		}
@@ -1327,7 +1365,7 @@ func solveSingleQuestionCmd(quizVon, searchVon *von.Client, sc solver.Config, qu
 }
 
 func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Config, mode SolveMode) (*solver.Result, error) {
-	research := func() ([]solver.Evidence, error) {
+	research := func(query string) ([]solver.Evidence, error) {
 		client := searchVon
 		if client == nil || client.HTTPBase != browser.SearchCDPURL || !browser.IsCDPAvailable(browser.SearchCDPURL) {
 			isolated, err := browser.EnsureHeadlessSearchBrowser(browser.BrowserInfo{})
@@ -1336,8 +1374,7 @@ func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Confi
 			}
 			client = isolated
 		}
-		query := q.Text
-		found, err := client.AdaptiveResearch(query, 18*time.Second)
+		found, err := client.AdaptiveResearch(query, 60*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -1359,7 +1396,7 @@ func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Confi
 				localErr = err
 			}
 		}
-		evidence, webErr := research()
+		evidence, webErr := research(q.Text)
 		if webErr != nil {
 			return nil, fmt.Errorf("Local → Web failed: local=%v; web=%w", localErr, webErr)
 		}
@@ -1372,52 +1409,35 @@ func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Confi
 		}
 		return result, nil
 
-	case ModeWebSearch:
-		evidence, webErr := research()
-		var webSolveErr error
-		if webErr == nil {
-			if result, err := solver.SolveWeb(q, evidence); err == nil {
-				return result, nil
-			} else {
-				webSolveErr = err
-			}
+	case ModeWebSearch, ModeHybrid:
+		if q.Type == extractor.TypeDropdown && len(q.Choices) == 0 {
+			return nil, fmt.Errorf("dropdown options could not be read")
 		}
-		if !isText {
-			result, localErr := solver.SolveLocal(q, nil, sc)
-			if localErr == nil {
-				result.FallbackPath = "Web → Local"
-				return result, nil
-			}
-			return nil, fmt.Errorf("Web → Local failed: search=%v; solve=%v; local=%v", webErr, webSolveErr, localErr)
-		}
-		return nil, fmt.Errorf("Web failed: search=%v; solve=%v", webErr, webSolveErr)
-
-	case ModeHybrid:
-		evidence, webErr := research()
-		if webErr != nil {
-			if !isText {
-				result, localErr := solver.SolveLocal(q, nil, sc)
-				if localErr == nil {
-					result.FallbackPath = "Hybrid → Local"
-					return result, nil
-				}
-				return nil, fmt.Errorf("Hybrid failed: web=%v; local=%v", webErr, localErr)
-			}
-			return nil, fmt.Errorf("Hybrid web research failed: %w", webErr)
-		}
-		if !isText {
-			if result, localErr := solver.SolveLocal(q, evidence, sc); localErr == nil {
-				return result, nil
-			}
-		}
-		result, err := solver.SolveWeb(q, evidence)
+		evidence, err := research(q.Text)
 		if err != nil {
-			return nil, fmt.Errorf("Hybrid → Web failed: %w", err)
+			return nil, fmt.Errorf("web research required: %w", err)
 		}
-		if !isText {
-			result.FallbackPath = "Hybrid → Web"
+		web, err := solver.SolveWeb(q, evidence)
+		if err != nil || web.LowConfidence {
+			query := strings.TrimSpace(q.Row + " " + q.Context)
+			if query == "" || query == q.Text {
+				query = q.Text + " explanation facts"
+			}
+			more, retryErr := research(query)
+			if retryErr == nil {
+				evidence = append(evidence, more...)
+				web, err = solver.SolveWeb(q, evidence)
+			}
 		}
-		return result, nil
+		if err != nil {
+			return nil, err
+		}
+		if mode == ModeWebSearch || isText || web.LowConfidence {
+			return web, nil
+		}
+		local, localErr := solver.SolveLocal(q, solver.RelevantEvidence(q, evidence), sc)
+		return solver.ReconcileHybrid(web, local, localErr)
+
 	default:
 		return nil, fmt.Errorf("unknown solve mode")
 	}
@@ -1438,5 +1458,15 @@ func advancePageCmd(v *von.Client) tea.Cmd {
 		}
 		result, err := extractor.ParseAdvanceResult(raw)
 		return pageAdvancedMsg{Result: result, Err: err}
+	}
+}
+
+func pollShortcutCmd(v *von.Client) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(750 * time.Millisecond)
+		if v == nil {
+			return shortcutPollMsg{}
+		}
+		return shortcutPollMsg{targetID: v.PollShortcut(), client: v}
 	}
 }

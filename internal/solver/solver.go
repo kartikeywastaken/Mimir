@@ -66,6 +66,9 @@ func SolveLocal(q *extractor.Question, evidence []Evidence, cfg Config) (*Result
 	client := laya.New()
 	if cfg.Model != "" {
 		client.Model = cfg.Model
+	} else if len(evidence) > 0 && strings.HasSuffix(client.Model, "-ane") {
+		// The 96-token ANE variant can discard most research context.
+		client.Model = strings.TrimSuffix(client.Model, "-ane")
 	}
 
 	// Build state: question + background research (hidden tab, like recursive Von trick)
@@ -180,6 +183,15 @@ func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
 	}
 
 	if len(q.Choices) == 0 {
+		relevant := RelevantEvidence(q, evidence)
+		passages = passages[:0]
+		for _, item := range relevant {
+			passages = append(passages, item.Passage)
+		}
+		if len(passages) == 0 {
+			return nil, fmt.Errorf("no evidence addresses the text question")
+		}
+		evidence = relevant
 		answer := strings.TrimSpace(extractAnswerFromSnippets(q.Text, passages))
 		if answer == "" {
 			return nil, fmt.Errorf("could not extract a text answer from web evidence")
@@ -187,63 +199,22 @@ func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
 		if answerEchoesQuestion(answer, q.Text) {
 			return nil, fmt.Errorf("web candidate repeated the question instead of answering it")
 		}
-		support := 0
-		answerLower := strings.ToLower(answer)
-		for _, passage := range passages {
-			if strings.Contains(strings.ToLower(passage), answerLower) {
-				support++
+		support := make(map[string]bool)
+		answerLower := strings.ToLower(strings.ReplaceAll(answer, ",", ""))
+		for _, item := range evidence {
+			if strings.Contains(strings.ToLower(strings.ReplaceAll(item.Passage, ",", "")), answerLower) && !negativePattern.MatchString(item.Passage) {
+				support[sourceKey(item)] = true
 			}
 		}
-		confidence := 72
-		if support >= 2 {
+		delete(support, "unattributed")
+		confidence := 65
+		if len(support) >= 2 {
 			confidence = 86
 		}
 		return normalizeResult(&Result{Values: []string{answer}, Confidence: confidence, Reason: "Answer extracted from isolated-browser evidence", SearchUsed: true, Backend: "web-evidence", Evidence: evidence}), nil
 	}
 
-	corpus := strings.ToLower(strings.Join(passages, " "))
-	type scoredChoice struct {
-		label string
-		score int
-	}
-	scores := make([]scoredChoice, 0, len(q.Choices))
-	tokenFrequency := choiceTokenFrequency(q.Choices)
-	for _, choice := range q.Choices {
-		score := evidenceScore(corpus, choice.Text, tokenFrequency)
-		scores = append(scores, scoredChoice{label: choice.Label, score: score})
-	}
-	best := 0
-	for _, score := range scores {
-		if score.score > best {
-			best = score.score
-		}
-	}
-	if best == 0 {
-		return nil, fmt.Errorf("web evidence did not support any answer option")
-	}
-	bestCount := 0
-	for _, score := range scores {
-		if score.score == best {
-			bestCount++
-		}
-	}
-	if q.Type != extractor.TypeCheckbox && bestCount != 1 {
-		return nil, fmt.Errorf("web evidence was ambiguous across %d answer options", bestCount)
-	}
-	values := make([]string, 0, 1)
-	for _, score := range scores {
-		if score.score == best || (q.Type == extractor.TypeCheckbox && score.score*4 >= best*3) {
-			values = append(values, score.label)
-			if q.Type != extractor.TypeCheckbox {
-				break
-			}
-		}
-	}
-	confidence := 60 + best*5
-	if confidence > 92 {
-		confidence = 92
-	}
-	return normalizeResult(&Result{Values: values, Confidence: confidence, Reason: "Answer option matched isolated-browser evidence", SearchUsed: true, Backend: "web-evidence", Evidence: evidence}), nil
+	return solveOptionsFromEvidence(q, evidence)
 }
 
 func normalizeResult(result *Result) *Result {
@@ -260,36 +231,6 @@ func evidenceText(evidence []Evidence) string {
 		parts = append(parts, strings.TrimSpace(item.Title+" — "+item.Passage))
 	}
 	return strings.Join(parts, "\n---\n")
-}
-
-func choiceTokenFrequency(choices []extractor.Choice) map[string]int {
-	frequency := make(map[string]int)
-	for _, choice := range choices {
-		seen := make(map[string]bool)
-		for _, token := range strings.Fields(strings.ToLower(choice.Text)) {
-			token = strings.Trim(token, ".,:;!?()[]{}\"'")
-			if token != "" && !seen[token] {
-				frequency[token]++
-				seen[token] = true
-			}
-		}
-	}
-	return frequency
-}
-
-func evidenceScore(corpus, choice string, tokenFrequency map[string]int) int {
-	choice = strings.ToLower(strings.TrimSpace(choice))
-	if choice == "" {
-		return 0
-	}
-	score := strings.Count(corpus, choice) * 12
-	for _, token := range strings.Fields(choice) {
-		token = strings.Trim(token, ".,:;!?()[]{}\"'")
-		if (len(token) >= 4 || regexp.MustCompile(`^\d+$`).MatchString(token)) && tokenFrequency[token] == 1 {
-			score += strings.Count(corpus, token) * 3
-		}
-	}
-	return score
 }
 
 func answerEchoesQuestion(answer, question string) bool {
@@ -337,6 +278,26 @@ func extractAnswerFromSnippets(query string, snippets []string) string {
 	}
 
 	joined := strings.Join(cleanedSnippets, " ")
+	if strings.Contains(qLower, "term") || strings.Contains(qLower, "study") {
+		re := regexp.MustCompile(`(?i)([a-z][a-z -]{1,40}) is (?:the )?(?:scientific |biological )?study of`)
+		if match := re.FindStringSubmatch(joined); len(match) > 1 {
+			return strings.TrimSpace(match[1])
+		}
+	}
+	if strings.Contains(qLower, "gas") {
+		patterns := []string{`(?i)([a-z]+(?: [a-z]+)?) is (?:the |a )?(?:primary |main )?(?:waste |byproduct)`, `(?i)(?:exhale|exhaled gas is|breathe out) (?:mainly |primarily )?([a-z]+(?: dioxide| monoxide| gas)?)`}
+		for _, pattern := range patterns {
+			if match := regexp.MustCompile(pattern).FindStringSubmatch(joined); len(match) > 1 {
+				return strings.TrimSpace(match[1])
+			}
+		}
+	}
+	if strings.Contains(qLower, "meters per second") || strings.Contains(qLower, "metres per second") {
+		re := regexp.MustCompile(`(?i)([0-9][0-9,]*(?:\.[0-9]+)?(?:\s*(?:×|x)\s*10\^?[0-9]+)?)\s*(?:meters per second|metres per second|m/s)`)
+		if match := re.FindStringSubmatch(joined); len(match) > 1 {
+			return strings.ReplaceAll(match[1], ",", "")
+		}
+	}
 
 	// 1. Long-form / Explanation questions ("why", "explain", "describe", "few sentences", "discuss")
 	if strings.Contains(qLower, "explain") || strings.Contains(qLower, "few sentences") || strings.HasPrefix(qLower, "why ") || strings.Contains(qLower, "describe") {
