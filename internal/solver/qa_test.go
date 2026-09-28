@@ -115,3 +115,52 @@ func TestWebSolverSupportsMultipleCheckboxValues(t *testing.T) {
 		t.Fatalf("expected multiple checkbox values A,C; got %+v", result.Values)
 	}
 }
+
+func TestQuestionClassifierSeparatesRespondentFieldsFromObjectiveQuestions(t *testing.T) {
+	tests := []struct {
+		name string
+		q    extractor.Question
+		want QuestionDisposition
+	}{
+		{name: "short profile label", q: extractor.Question{Text: "Class group:", Context: "Class group:"}, want: DispositionRespondent},
+		{name: "identity description", q: extractor.Question{Text: "Identification", Context: "Please enter your first and last name"}, want: DispositionRespondent},
+		{name: "objective question", q: extractor.Question{Text: "Who discovered penicillin?"}, want: DispositionObjective},
+		{name: "objective instruction", q: extractor.Question{Text: "Select all compounds that are acids"}, want: DispositionObjective},
+		{name: "personal question", q: extractor.Question{Text: "What is your preferred schedule?"}, want: DispositionRespondent},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ClassifyQuestion(&tc.q, Config{})
+			if err != nil {
+				t.Fatalf("unexpected classification error: %v", err)
+			}
+			if got.Disposition != tc.want {
+				t.Fatalf("disposition=%q want=%q (%s)", got.Disposition, tc.want, got.Reason)
+			}
+		})
+	}
+}
+
+func TestMixedFormClassificationDoesNotTouchRespondentFields(t *testing.T) {
+	questions := []struct {
+		text    string
+		context string
+		want    QuestionDisposition
+	}{
+		{"Name:", "Name: Please type in your first and last name.", DispositionRespondent},
+		{"Class Period:", "Class Period: Period 1 Period 2 Period 5 Period 8", DispositionRespondent},
+		{"Who was Luke's father?", "", DispositionObjective},
+		{"Select all the movies directed by George Lucas", "", DispositionObjective},
+		{"The latest villain, Kylo Ren, what is his real name?", "", DispositionObjective},
+		{"In a few sentences, explain why Jar Jar Binks was a necessary character.", "", DispositionObjective},
+	}
+	for _, item := range questions {
+		got, err := ClassifyQuestion(&extractor.Question{Text: item.text, Context: item.context}, Config{})
+		if err != nil {
+			t.Fatalf("classify %q: %v", item.text, err)
+		}
+		if got.Disposition != item.want {
+			t.Fatalf("%q classified as %q, want %q", item.text, got.Disposition, item.want)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -336,7 +337,8 @@ func (c *Client) AdaptiveResearch(query string, timeout time.Duration) ([]Search
 
 func (c *Client) enrichEvidence(query string, evidence []SearchEvidence, deadline time.Time) []SearchEvidence {
 	lower := strings.ToLower(query)
-	deep := len(evidence) < 2 || strings.Contains(lower, "explain") || strings.Contains(lower, "describe") || strings.Contains(lower, "why ")
+	deep := len(evidence) < 2 || strings.Contains(lower, "explain") || strings.Contains(lower, "describe") ||
+		strings.Contains(lower, "why ") || strings.Contains(lower, "select all") || strings.HasPrefix(lower, "which ")
 	if !deep {
 		return evidence
 	}
@@ -344,7 +346,7 @@ func (c *Client) enrichEvidence(query string, evidence []SearchEvidence, deadlin
 		const parts=[];
 		document.querySelectorAll('article p, main p, [role="main"] p, p').forEach(p=>{
 			const t=(p.innerText||'').trim().replace(/\s+/g,' ');
-			if(t.length>80 && parts.length<4) parts.push(t.slice(0,700));
+			if(t.length>80 && parts.length<30) parts.push(t.slice(0,700));
 		});
 		return JSON.stringify(parts);
 	})()`
@@ -372,10 +374,31 @@ func (c *Client) enrichEvidence(query string, evidence []SearchEvidence, deadlin
 		}
 		var passages []string
 		if json.Unmarshal([]byte(raw), &passages) == nil && len(passages) > 0 {
+			sort.SliceStable(passages, func(a, b int) bool {
+				return passageRelevance(query, passages[a]) > passageRelevance(query, passages[b])
+			})
+			if len(passages) > 4 {
+				passages = passages[:4]
+			}
 			evidence[i].Passage += " " + strings.Join(passages, " ")
 		}
 	}
 	return evidence
+}
+
+func passageRelevance(query, passage string) int {
+	passage = strings.ToLower(passage)
+	seen := make(map[string]bool)
+	score := 0
+	for _, token := range strings.Fields(strings.ToLower(query)) {
+		token = strings.Trim(token, ".,:;!?()[]{}\"'")
+		if len(token) < 4 || seen[token] {
+			continue
+		}
+		seen[token] = true
+		score += strings.Count(passage, token)
+	}
+	return score
 }
 
 // BackgroundSearch is retained for compatibility with callers that only need

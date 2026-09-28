@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"mimir/internal/extractor"
 	"mimir/internal/solver"
+	"mimir/internal/von"
 )
 
 func sizedModel(t *testing.T, width, height int) Model {
@@ -23,7 +25,7 @@ func TestTUIShellAndCoreStates(t *testing.T) {
 	model := sizedModel(t, 100, 30)
 
 	view := model.View()
-	for _, expected := range []string{"ᛗ Mimir", "Local AI", "Paste a quiz URL"} {
+	for _, expected := range []string{"█▀▄▀█", "Local intelligence for browser forms", "Paste a quiz URL"} {
 		if !strings.Contains(view, expected) {
 			t.Fatalf("setup view missing %q:\n%s", expected, view)
 		}
@@ -164,8 +166,40 @@ func TestInitialURLAndASCIIWordmark(t *testing.T) {
 	if model.state != StateURLInput || model.urlInput.Value() != "https://example.test/quiz" {
 		t.Fatalf("initial URL should populate the shared setup composer; state=%d value=%q", model.state, model.urlInput.Value())
 	}
-	if strings.Contains(view, "ᛗ") || !strings.Contains(view, "Mimir") {
+	if strings.Contains(view, "ᛗ") || !strings.Contains(view, "M I M I R") {
 		t.Fatalf("ASCII wordmark fallback was not applied:\n%s", view)
+	}
+}
+
+func TestBrowserWaitsForExplicitSolveShortcut(t *testing.T) {
+	model := sizedModel(t, 100, 30)
+	updated, _ := model.Update(browserLaunchedMsg{v: von.New("http://127.0.0.1:9222")})
+	model = updated.(Model)
+	if model.state != StateWaitingForStart {
+		t.Fatalf("browser launch immediately entered state %v; want explicit-start wait", model.state)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Ctrl+P") || !strings.Contains(view, "LATEST ACTIVITY") || !strings.Contains(view, "WAIT") {
+		t.Fatalf("waiting UI must advertise Ctrl+P:\n%s", view)
+	}
+}
+
+func TestDecisionTraceShowsUsefulSignals(t *testing.T) {
+	model := sizedModel(t, 100, 30)
+	model.traceEvent("THINK", "Q1 · classify → Hybrid")
+	model.traceEvent("SOURCE", "Example reference")
+	model.traceEvent("FILL", "Q1 · B · web-evidence · 86%")
+	view := model.View()
+	for _, expected := range []string{"LATEST ACTIVITY", "THINK", "SOURCE", "86%"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("decision trace missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestQuestionPacingIsAccuracyFirst(t *testing.T) {
+	if questionPace != 2*time.Second {
+		t.Fatalf("question pace=%s, want 2s", questionPace)
 	}
 }
 

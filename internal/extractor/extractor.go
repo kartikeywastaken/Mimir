@@ -22,6 +22,7 @@ type Question struct {
 	TargetID      string       `json:"target_id,omitempty"`
 	Type          QuestionType `json:"type,omitempty"` // "choice", "text", "dropdown"
 	Text          string       `json:"text"`
+	Context       string       `json:"context,omitempty"`
 	Choices       []Choice     `json:"choices,omitempty"`
 	RawHTML       string       `json:"raw_html,omitempty"`
 	SolvedAns     string       `json:"solved_ans,omitempty"`
@@ -30,6 +31,8 @@ type Question struct {
 	Marked        bool         `json:"marked,omitempty"`
 	LowConfidence bool         `json:"low_confidence,omitempty"`
 	SolveError    string       `json:"solve_error,omitempty"`
+	Skipped       bool         `json:"skipped,omitempty"`
+	SkipReason    string       `json:"skip_reason,omitempty"`
 }
 
 type Choice struct {
@@ -153,6 +156,7 @@ const ExtractAllJS = `
 		  target_id: targetID,
 		  type: choiceInputs.some(inp => inp.type === 'checkbox' || inp.getAttribute('role') === 'checkbox') ? "checkbox" : "choice",
           text: promptText,
+		  context: text(card),
           choices: choices
         });
         return;
@@ -191,6 +195,7 @@ const ExtractAllJS = `
 		  target_id: targetID,
           type: "dropdown",
           text: promptText,
+		  context: text(card),
           choices: choices
         });
         return;
@@ -206,6 +211,7 @@ const ExtractAllJS = `
 		  target_id: targetID,
 		  type: textInput.tagName === 'TEXTAREA' || textInput.getAttribute('aria-multiline') === 'true' ? "paragraph" : "text",
           text: promptText,
+		  context: text(card),
           choices: []
         });
         return;
@@ -264,6 +270,7 @@ const ExtractAllJS = `
 		target_id: targetID,
 		type: inputs.some(inp => inp.type === 'checkbox' || inp.getAttribute('role') === 'checkbox') ? "checkbox" : "choice",
         text: promptText,
+		context: promptText,
         choices: choices
       });
     });
@@ -299,10 +306,10 @@ const ExtractAllJS = `
             choices.push({label:String.fromCharCode(65 + choices.length), text:optionText});
           }
         });
-        questions.push({index:qIdx, target_id:targetID, type:'dropdown', text:promptText, choices});
+        questions.push({index:qIdx, target_id:targetID, type:'dropdown', text:promptText, context:promptText, choices});
       } else {
         const paragraph = control.tagName === 'TEXTAREA' || control.getAttribute('aria-multiline') === 'true';
-        questions.push({index:qIdx, target_id:targetID, type:paragraph ? 'paragraph' : 'text', text:promptText, choices:[]});
+        questions.push({index:qIdx, target_id:targetID, type:paragraph ? 'paragraph' : 'text', text:promptText, context:promptText, choices:[]});
       }
     });
   }

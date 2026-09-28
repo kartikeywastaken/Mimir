@@ -184,9 +184,19 @@ func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
 		if answer == "" {
 			return nil, fmt.Errorf("could not extract a text answer from web evidence")
 		}
-		confidence := 76
-		if len(evidence) > 1 {
-			confidence = 84
+		if answerEchoesQuestion(answer, q.Text) {
+			return nil, fmt.Errorf("web candidate repeated the question instead of answering it")
+		}
+		support := 0
+		answerLower := strings.ToLower(answer)
+		for _, passage := range passages {
+			if strings.Contains(strings.ToLower(passage), answerLower) {
+				support++
+			}
+		}
+		confidence := 72
+		if support >= 2 {
+			confidence = 86
 		}
 		return normalizeResult(&Result{Values: []string{answer}, Confidence: confidence, Reason: "Answer extracted from isolated-browser evidence", SearchUsed: true, Backend: "web-evidence", Evidence: evidence}), nil
 	}
@@ -197,8 +207,9 @@ func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
 		score int
 	}
 	scores := make([]scoredChoice, 0, len(q.Choices))
+	tokenFrequency := choiceTokenFrequency(q.Choices)
 	for _, choice := range q.Choices {
-		score := evidenceScore(corpus, choice.Text)
+		score := evidenceScore(corpus, choice.Text, tokenFrequency)
 		scores = append(scores, scoredChoice{label: choice.Label, score: score})
 	}
 	best := 0
@@ -209,6 +220,15 @@ func SolveWeb(q *extractor.Question, evidence []Evidence) (*Result, error) {
 	}
 	if best == 0 {
 		return nil, fmt.Errorf("web evidence did not support any answer option")
+	}
+	bestCount := 0
+	for _, score := range scores {
+		if score.score == best {
+			bestCount++
+		}
+	}
+	if q.Type != extractor.TypeCheckbox && bestCount != 1 {
+		return nil, fmt.Errorf("web evidence was ambiguous across %d answer options", bestCount)
 	}
 	values := make([]string, 0, 1)
 	for _, score := range scores {
@@ -242,19 +262,48 @@ func evidenceText(evidence []Evidence) string {
 	return strings.Join(parts, "\n---\n")
 }
 
-func evidenceScore(corpus, choice string) int {
+func choiceTokenFrequency(choices []extractor.Choice) map[string]int {
+	frequency := make(map[string]int)
+	for _, choice := range choices {
+		seen := make(map[string]bool)
+		for _, token := range strings.Fields(strings.ToLower(choice.Text)) {
+			token = strings.Trim(token, ".,:;!?()[]{}\"'")
+			if token != "" && !seen[token] {
+				frequency[token]++
+				seen[token] = true
+			}
+		}
+	}
+	return frequency
+}
+
+func evidenceScore(corpus, choice string, tokenFrequency map[string]int) int {
 	choice = strings.ToLower(strings.TrimSpace(choice))
 	if choice == "" {
 		return 0
 	}
-	score := strings.Count(corpus, choice) * 4
+	score := strings.Count(corpus, choice) * 12
 	for _, token := range strings.Fields(choice) {
 		token = strings.Trim(token, ".,:;!?()[]{}\"'")
-		if len(token) >= 4 {
-			score += strings.Count(corpus, token)
+		if (len(token) >= 4 || regexp.MustCompile(`^\d+$`).MatchString(token)) && tokenFrequency[token] == 1 {
+			score += strings.Count(corpus, token) * 3
 		}
 	}
 	return score
+}
+
+func answerEchoesQuestion(answer, question string) bool {
+	normalize := func(value string) string {
+		value = strings.ToLower(value)
+		value = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(value, " ")
+		return strings.TrimSpace(value)
+	}
+	a := normalize(answer)
+	q := normalize(question)
+	if a == "" || q == "" {
+		return true
+	}
+	return a == q || (len(a) > 20 && strings.Contains(a, q))
 }
 
 func extractAnswerFromSnippets(query string, snippets []string) string {

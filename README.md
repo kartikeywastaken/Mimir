@@ -22,7 +22,7 @@ Web research runs in a separate headless Chromium process on port `9223`. Search
 - **Web:** Browser evidence answers every supported field; selectable questions fall back to Laya when research cannot resolve them.
 - **Hybrid:** The browser gathers evidence and Laya selects or validates selectable answers. A valid result from either component can be used if the other fails.
 
-Mimir supports radio buttons, multi-select checkboxes, dropdowns, short answers, and paragraphs. Low-confidence real answers are filled and flagged. If no real answer can be obtained or the DOM write cannot be verified, the field is left unchanged and reported as unresolved. Mock answers are never written.
+Mimir supports radio buttons, multi-select checkboxes, dropdowns, short answers, and paragraphs. Before solving, it classifies fields as objective questions, respondent-owned fields, or non-questions. Personal/profile fields and ambiguous prompts are left untouched. Answers below the 70% safety threshold, missing evidence, and failed DOM writes are also left unchanged. Mock answers are never written.
 
 Built in **Go** + **Bubble Tea** TUI + **Gum**.
 
@@ -110,9 +110,7 @@ cp config.yaml.example config.yaml
 
 | Key | Action |
 |-----|--------|
-| `e` | Extract and solve questions from the active form page |
-| `s` | Re-solve the current page using the active mode |
-| `a` | Toggle automatic extraction polling |
+| `ctrl+p` | Start solving after the form is open and respondent details are filled |
 | `m` | Choose solving mode |
 | `b` | Choose browser |
 | `/` | Open the command composer |
@@ -123,6 +121,13 @@ monospace font that includes Unicode runes. Set `MIMIR_ASCII=1` to use the
 plain `Mimir` wordmark when the rune glyph is unavailable. The fullscreen TUI
 runs in the terminal's alternate screen and restores normal terminal behavior
 when it exits. The selected mode is persisted in the OS user-config directory.
+Mimir does not begin extracting or solving when the browser opens; it waits for
+`ctrl+p`, then spaces question attempts by two seconds.
+
+The centered UI includes a compact decision trace showing classification,
+pipeline/backend, evidence sources, confidence, fallbacks, verified fills, and
+fields deliberately left for the respondent. It reports operational reasoning
+without exposing or inventing hidden model chain-of-thought.
 
 ## Architecture
 
