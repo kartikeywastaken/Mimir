@@ -1,0 +1,17 @@
+[package]
+name = "mimir-permissions"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mimir-permissions"
+path = "src/main.rs"
+
+[dependencies]
+log = { workspace = true }
+env_logger = { workspace = true }
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication", "NSApplication"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSURL"] }

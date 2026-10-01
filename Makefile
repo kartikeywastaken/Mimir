@@ -1,4 +1,7 @@
-.PHONY: run build setup tidy test gum-demo ramdisk
+.PHONY: run build setup tidy test gum-demo ramdisk rust-build rust-dev daemon setup-daemon clean-rust
+
+RUST_DIR    := ./rust
+DAEMON_BIN  := ./bin/mimir-daemon
 
 # macOS 15 APFS bug: F_PREALLOCATE fails with EILSEQ for binaries >=5M (see Go issue)
 # Workaround: build on HFS+ RAM disk where fcntl(F_PREALLOCATE) and mmap succeed
@@ -50,3 +53,35 @@ clean-ramdisk:
 	hdiutil detach $(RAMDISK) 2>/dev/null || true
 	rm -f $(RAMDISK_DMG)
 	rm -rf $(RAMDISK)
+
+# ── Rust daemon targets ──────────────────────────────────────────────────────
+
+# Build the Rust mimir-daemon binary (release mode)
+rust-build:
+	@mkdir -p ./bin
+	cd $(RUST_DIR) && cargo build --release -p mimir-daemon
+	cp $(RUST_DIR)/target/release/mimir-daemon $(DAEMON_BIN)
+	chmod +x $(DAEMON_BIN)
+	@echo "✓ bin/mimir-daemon built"
+
+# Fast debug build for development iteration
+rust-dev:
+	cd $(RUST_DIR) && cargo build -p mimir-daemon
+	@echo "✓ rust debug build done: $(RUST_DIR)/target/debug/mimir-daemon"
+
+# Build everything: Go solver + Rust daemon
+daemon: build rust-build
+	@echo "✓ mimir + mimir-daemon ready"
+
+# First-launch permission helper (runs the mimir-permissions binary)
+setup-daemon: rust-build
+	$(RUST_DIR)/target/release/mimir-permissions
+	@echo "✓ permissions checked"
+
+# Run lints + tests for Rust
+rust-test:
+	cd $(RUST_DIR) && cargo clippy -- -D warnings && cargo test
+
+# Remove Rust build artifacts
+clean-rust:
+	cd $(RUST_DIR) && cargo clean

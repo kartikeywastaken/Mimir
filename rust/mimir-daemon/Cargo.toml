@@ -1,0 +1,44 @@
+[package]
+name = "mimir-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mimir-daemon"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arboard = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+uuid = { workspace = true }
+core-foundation = { workspace = true }
+core-foundation-sys = "0.8"
+core-graphics = { workspace = true }
+anyhow = "1"
+
+# rdev for global hotkey / input event listening
+rdev = "0.5"
+
+# objc2 for NSPanel, NSApplication, NSWorkspace (HUD overlay)
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSString", "NSThread", "NSDictionary", "NSArray"] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSPanel",
+    "NSView",
+    "NSTextField",
+    "NSButton",
+    "NSColor",
+    "NSFont",
+    "NSScreen",
+    "NSWorkspace",
+    "NSRunningApplication",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = "0.1"
