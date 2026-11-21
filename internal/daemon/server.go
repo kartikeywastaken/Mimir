@@ -171,45 +171,21 @@ func (s *Server) solve(ctx context.Context, req SolveRequest) SolveResponse {
 		q.Type = extractor.TypeChoice
 	}
 
-	// Use a short timeout so the Rust side doesn't hang indefinitely.
-	_, cancel := context.WithTimeout(ctx, 28*time.Second)
+	// Bound each request so the Rust side never hangs.
+	solveCtx, cancel := context.WithTimeout(ctx, 28*time.Second)
 	defer cancel()
 
-	// Daemon solve strategy:
-	//   - MCQ with choices → SolveLocal (Laya typed decision, fast, private)
-	//   - Text fields or no choices → SolveWeb (web research evidence)
-	//   - "web" backend override → always SolveWeb
-	//   - "local" backend override → always SolveLocal
-	backend := s.cfg.Backend
-	if backend == "" {
-		if q.Type == extractor.TypeChoice && len(q.Choices) > 0 {
-			backend = "local"
-		} else {
-			backend = "web"
-		}
-	}
-
+	// The daemon has no research browser, so it only uses the local backend.
+	// Laya handles options; an LLM backend also handles free text.
 	var result *solver.Result
 	var solveErr error
-
-	switch backend {
-	case "local":
-		result, solveErr = solver.SolveLocal(q, nil, s.cfg)
-	default: // "web" or unrecognised — use top-level Solve which does research
-		// SolveWeb requires pre-fetched evidence; for daemon mode without a
-		// running Von browser we use SolveLocal even for text (returns error
-		// if no choices) so the Rust side knows the question is unresolved.
-		if len(q.Choices) > 0 {
-			result, solveErr = solver.SolveLocal(q, nil, s.cfg)
-		} else {
-			// No choices and no browser: return an unresolved hint
-			result = &solver.Result{
-				Answer:        "",
-				Confidence:    0,
-				Reason:        "text question without browser — start Von/laya-browser and retry",
-				Backend:       "daemon-noop",
-				LowConfidence: true,
-			}
+	if solver.LocalCanAnswer(q, s.cfg) {
+		result, solveErr = solver.SolveLocalContext(solveCtx, q, nil, s.cfg)
+	} else {
+		result = &solver.Result{
+			Reason:        "text questions need an LLM backend (set GROQ_API_KEY) or the TUI's web research",
+			Backend:       "daemon-noop",
+			LowConfidence: true,
 		}
 	}
 
@@ -229,7 +205,7 @@ func (s *Server) solve(ctx context.Context, req SolveRequest) SolveResponse {
 
 	// Decide fill strategy hint for the Rust filler.
 	// AX fill is possible for native MCQ when confidence is high.
-	if q.Type == extractor.TypeChoice && result.Confidence >= 70 {
+	if q.Type == extractor.TypeChoice && !result.LowConfidence {
 		resp.FillStrategy = "ax"
 	}
 

@@ -1,15 +1,23 @@
+// Package solver turns extracted questions into answers. Answers come from a
+// pluggable local Backend (Laya or an LLM), from isolated-browser web
+// evidence, or from both reconciled together (Hybrid).
 package solver
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
 	"mimir/internal/extractor"
-	"mimir/internal/laya"
+	"mimir/internal/llm"
 )
 
-// Result from Laya (local, no API key)
+// LowConfidenceThreshold is the minimum confidence for automatic filling.
+const LowConfidenceThreshold = 70
+
+// Result is a structured answer from any backend.
 type Result struct {
 	Values        []string   `json:"values"`
 	Answer        string     `json:"answer,omitempty"` // compatibility: first value
@@ -29,142 +37,75 @@ type Evidence struct {
 	Passage string `json:"passage"`
 }
 
+// Engine selects which local backend answers questions.
+type Engine string
+
+const (
+	EngineAuto Engine = "auto" // LLM when configured, otherwise Laya
+	EngineLaya Engine = "laya"
+	EngineLLM  Engine = "llm"
+)
+
 type Config struct {
-	Model        string
-	Instructions string
-	Backend      string
+	Model        string // Laya model override
+	Instructions string // Laya decision instructions
+	Engine       Engine
+	LLM          llm.Config
 }
 
+// ConfigFromEnv builds a Config from MIMIR_ENGINE, LAYA_MODEL and the
+// MIMIR_LLM_* / GROQ_API_KEY variables.
 func ConfigFromEnv() Config {
-	// LAYA_MODEL env — same as laya-browser and laya-coreml
-	// Default: aac6fef/laya-multilingual-coreml-ane (96 tokens, ~5ms ANE)
-	// For 1024 tokens: aac6fef/laya-multilingual-coreml or aac6fef/laya-mlx
+	engine := Engine(strings.ToLower(strings.TrimSpace(os.Getenv("MIMIR_ENGINE"))))
+	switch engine {
+	case EngineLaya, EngineLLM:
+	default:
+		engine = EngineAuto
+	}
 	return Config{
-		Model:        "",
+		Model:        os.Getenv("LAYA_MODEL"),
 		Instructions: "Which answer correctly answers the question?",
+		Engine:       engine,
+		LLM:          llm.ConfigFromEnv(),
 	}
 }
 
-// Solve via local Laya typed decision (no OpenAI key).
-// state = question + search snippets, criteria = choices
-// This mirrors layaForWeb's choice type but runs natively via laya-coreml/mlx.
-// See: https://vishalmysore.github.io/layaForWeb/ (ONNX WASM) vs laya-coreml (CoreML) vs laya-mlx (laya-browser)
-func Solve(q *extractor.Question, searchSnippets []string, cfg Config) (*Result, error) {
-	evidence := make([]Evidence, 0, len(searchSnippets))
-	for _, snippet := range searchSnippets {
-		evidence = append(evidence, Evidence{Passage: snippet})
-	}
-	if len(q.Choices) == 0 {
-		return SolveWeb(q, evidence)
-	}
-	return SolveLocal(q, evidence, cfg)
-}
-
-// SolveLocal makes a real typed decision with Laya. It never returns a mock or
-// default answer. Evidence is optional and is used by Hybrid mode.
+// SolveLocal answers with the configured local backend. Evidence is optional
+// and is supplied by Hybrid mode. It never returns a mock or default answer.
 func SolveLocal(q *extractor.Question, evidence []Evidence, cfg Config) (*Result, error) {
-	client := laya.New()
-	if cfg.Model != "" {
-		client.Model = cfg.Model
-	} else if len(evidence) > 0 && strings.HasSuffix(client.Model, "-ane") {
-		// The 96-token ANE variant can discard most research context.
-		client.Model = strings.TrimSuffix(client.Model, "-ane")
-	}
-
-	// Build state: question + background research (hidden tab, like recursive Von trick)
-	state := q.Text
-	if len(evidence) > 0 {
-		state += "\n\nBackground research (isolated browser):\n" + evidenceText(evidence)
-	}
-	// Truncate for ANE 96-token limit vs 1024 for general
-	// laya client does its own truncation, but we also keep it short
-	if len(state) > 2000 {
-		state = state[:2000] + "..."
-	}
-
-	if len(q.Choices) == 0 {
-		return nil, fmt.Errorf("local Laya cannot generate free text")
-	}
-
-	if q.Type == extractor.TypeCheckbox {
-		return solveCheckboxLocal(client, q, state, evidence, cfg)
-	}
-
-	choices := make([]laya.Choice, len(q.Choices))
-	for i, c := range q.Choices {
-		choices[i] = laya.Choice{Label: c.Label, Text: c.Text}
-	}
-
-	resp, err := client.Predict(state, q.Text, choices, cfg.Instructions)
-	if err != nil {
-		return nil, fmt.Errorf("laya decision: %w", err)
-	}
-	if resp.Mock || resp.Answer == "" {
-		return nil, fmt.Errorf("laya returned no real answer")
-	}
-	valid := false
-	for _, choice := range q.Choices {
-		if choice.Label == resp.Answer {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return nil, fmt.Errorf("laya returned unknown choice %q", resp.Answer)
-	}
-
-	// Laya confidence is 0-1, convert to 0-100
-	conf := int(resp.Confidence*100 + 0.5)
-	// Clamp real model confidence without inventing a default.
-	if conf > 98 {
-		conf = 98
-	}
-	if conf < 1 {
-		conf = 1
-	}
-
-	reason := fmt.Sprintf("Laya %s (%.0f%%) — typed decision over %d options. %s",
-		resp.Backend, resp.Confidence*100, len(choices),
-		map[bool]string{true: "with isolated-browser evidence", false: "without web evidence"}[len(evidence) > 0],
-	)
-
-	return normalizeResult(&Result{
-		Values:     []string{resp.Answer},
-		Answer:     resp.Answer,
-		Confidence: conf,
-		Reason:     reason,
-		SearchUsed: len(evidence) > 0,
-		Backend:    resp.Backend,
-		RawChoice:  resp.Choice,
-		Evidence:   evidence,
-	}), nil
+	return SolveLocalContext(context.Background(), q, evidence, cfg)
 }
 
-func solveCheckboxLocal(client *laya.Client, q *extractor.Question, state string, evidence []Evidence, cfg Config) (*Result, error) {
-	selected := make([]string, 0, len(q.Choices))
-	confidence := 100
-	for _, option := range q.Choices {
-		choices := []laya.Choice{{Label: "Y", Text: "Yes, select this option"}, {Label: "N", Text: "No, do not select this option"}}
-		question := fmt.Sprintf("For %q, should %q be selected?", q.Text, option.Text)
-		resp, err := client.Predict(state, question, choices, "Decide whether this individual option is correct. Select Yes only when supported.")
-		if err != nil {
-			return nil, fmt.Errorf("laya checkbox decision for %s failed: %w", option.Label, err)
-		}
-		if resp.Mock || (resp.Answer != "Y" && resp.Answer != "N") {
-			return nil, fmt.Errorf("laya checkbox decision for %s was invalid", option.Label)
-		}
-		if resp.Answer == "Y" {
-			selected = append(selected, option.Label)
-		}
-		optionConfidence := int(resp.Confidence*100 + 0.5)
-		if optionConfidence < confidence {
-			confidence = optionConfidence
-		}
+// SolveLocalContext is SolveLocal with cancellation.
+func SolveLocalContext(ctx context.Context, q *extractor.Question, evidence []Evidence, cfg Config) (*Result, error) {
+	backend := LocalBackend(cfg)
+	if !backend.CanAnswer(q) {
+		return nil, fmt.Errorf("%s cannot answer %s questions", backend.Name(), q.Type)
 	}
-	if len(selected) == 0 {
-		return nil, fmt.Errorf("laya selected no checkbox options")
+	result, err := backend.Answer(ctx, q, evidence)
+	if err != nil {
+		return nil, err
 	}
-	return normalizeResult(&Result{Values: selected, Confidence: confidence, Reason: "Laya independently evaluated each checkbox option", SearchUsed: len(evidence) > 0, Backend: "laya", Evidence: evidence}), nil
+	return normalizeResult(result), nil
+}
+
+// LocalCanAnswer reports whether the configured local backend handles q.
+func LocalCanAnswer(q *extractor.Question, cfg Config) bool {
+	return LocalBackend(cfg).CanAnswer(q)
+}
+
+func isFreeText(q *extractor.Question) bool {
+	return q.Type == extractor.TypeText || q.Type == extractor.TypeParagraph || len(q.Choices) == 0
+}
+
+func clampConfidence(c int) int {
+	if c > 98 {
+		return 98
+	}
+	if c < 1 {
+		return 1
+	}
+	return c
 }
 
 // SolveWeb derives an answer only from real isolated-browser evidence.
@@ -221,7 +162,7 @@ func normalizeResult(result *Result) *Result {
 	if len(result.Values) > 0 {
 		result.Answer = result.Values[0]
 	}
-	result.LowConfidence = result.Confidence < 70
+	result.LowConfidence = result.Confidence < LowConfidenceThreshold
 	return result
 }
 

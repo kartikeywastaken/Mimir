@@ -1,12 +1,15 @@
 package solver
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"mimir/internal/extractor"
 	"mimir/internal/laya"
+	"mimir/internal/llm"
 )
 
 type QuestionDisposition string
@@ -53,6 +56,10 @@ func ClassifyQuestion(q *extractor.Question, cfg Config) (Classification, error)
 		return Classification{Disposition: DispositionRespondent, Reason: "label-shaped field without an objective question", Backend: "safety-rules"}, nil
 	}
 
+	if b, ok := LocalBackend(cfg).(*llmBackend); ok {
+		return b.classify(combined)
+	}
+
 	client := laya.New()
 	if cfg.Model != "" {
 		client.Model = cfg.Model
@@ -78,5 +85,40 @@ func ClassifyQuestion(q *extractor.Question, cfg Config) (Classification, error)
 		return Classification{Disposition: DispositionNonQuestion, Reason: "Laya classified it as non-question content", Backend: resp.Backend}, nil
 	default:
 		return Classification{Disposition: DispositionRespondent, Reason: "ambiguous classifier response; skipped safely", Backend: "fail-closed"}, fmt.Errorf("classifier returned unknown label %q", resp.Answer)
+	}
+}
+
+const llmClassifyPrompt = `Classify a form field. Reply with JSON {"label": "O"|"R"|"N"}.
+O = objective knowledge or reasoning question answerable from facts or supplied context.
+R = respondent-owned: identity, contact details, preferences, experience, opinions, or personal choices.
+N = instruction, section heading, decoration, or other non-question content.
+Protect respondent data: choose O only when someone other than the respondent could answer it.`
+
+func (b *llmBackend) classify(field string) (Classification, error) {
+	failClosed := Classification{Disposition: DispositionRespondent, Reason: "ambiguous field skipped because semantic classification was unavailable", Backend: "fail-closed"}
+	if !b.cfg.Configured() {
+		return failClosed, fmt.Errorf("llm classifier not configured")
+	}
+	var reply struct {
+		Label string `json:"label"`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := b.client.ChatJSON(ctx, []llm.Message{
+		{Role: "system", Content: llmClassifyPrompt},
+		{Role: "user", Content: field},
+	}, &reply); err != nil {
+		return failClosed, fmt.Errorf("classify field: %w", err)
+	}
+	switch strings.ToUpper(strings.TrimSpace(reply.Label)) {
+	case "O":
+		return Classification{Disposition: DispositionObjective, Reason: "LLM classified it as objective", Backend: "llm"}, nil
+	case "R":
+		return Classification{Disposition: DispositionRespondent, Reason: "LLM classified it as respondent-owned", Backend: "llm"}, nil
+	case "N":
+		return Classification{Disposition: DispositionNonQuestion, Reason: "LLM classified it as non-question content", Backend: "llm"}, nil
+	default:
+		failClosed.Reason = "ambiguous classifier response; skipped safely"
+		return failClosed, fmt.Errorf("classifier returned unknown label %q", reply.Label)
 	}
 }

@@ -9,7 +9,6 @@ mod filler;
 mod hotkey;
 mod ipc;
 mod overlay;
-mod screen_guard;
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -95,7 +94,15 @@ async fn main() {
     }
 }
 
-/// Full solve pipeline: extract → IPC solve → screen guard → show/fill.
+/// `MIMIR_AUTOFILL=1` makes the daemon fill the answer after showing it.
+fn autofill_enabled() -> bool {
+    matches!(
+        std::env::var("MIMIR_AUTOFILL").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Full solve pipeline: extract → IPC solve → show → optional fill.
 async fn run_solve_pipeline() -> anyhow::Result<()> {
     use anyhow::Context;
 
@@ -122,16 +129,15 @@ async fn run_solve_pipeline() -> anyhow::Result<()> {
         response.answer, response.confidence, response.backend
     );
 
-    let screen_monitored = screen_guard::is_screen_monitored();
+    // The overlay always shows the answer. Filling is an explicit opt-in and
+    // behaves the same regardless of who else can see the screen.
+    overlay::show(&extraction, &response).await;
 
-    if screen_monitored {
-        info!("screen monitored → silent auto-fill");
+    if autofill_enabled() && !response.answer.is_empty() {
+        info!("auto-fill enabled → applying answer");
         filler::apply(&extraction, &response)
             .map_err(|e| anyhow::anyhow!(e))
-            .context("silent fill failed")?;
-    } else {
-        info!("screen not monitored → HUD overlay");
-        overlay::show(&extraction, &response).await;
+            .context("fill failed")?;
     }
 
     Ok(())
@@ -139,7 +145,6 @@ async fn run_solve_pipeline() -> anyhow::Result<()> {
 
 fn check_permissions() {
     let ax_ok = ax_extractor::check_accessibility_permission();
-    let screen_ok = screen_guard::check_screen_recording_permission();
 
     if !ax_ok {
         warn!("Accessibility permission missing — opening System Preferences");
@@ -148,15 +153,6 @@ fn check_permissions() {
         );
     } else {
         info!("Accessibility: ✓");
-    }
-
-    if !screen_ok {
-        warn!("Screen Recording permission missing — opening System Preferences");
-        open_sys_prefs(
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-        );
-    } else {
-        info!("Screen Recording: ✓");
     }
 }
 

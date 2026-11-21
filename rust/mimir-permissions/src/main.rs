@@ -1,9 +1,8 @@
 //! mimir-permissions — first-launch macOS permission checker
 //!
-//! Checks the three permissions required by mimir-daemon:
-//!   1. Accessibility (kTCCServiceAccessibility)
-//!   2. Screen Recording (kTCCServiceScreenCapture)
-//!   3. Input Monitoring (kTCCServiceListenEvent) — checked implicitly by rdev
+//! Checks the two permissions required by mimir-daemon:
+//!   1. Accessibility (kTCCServiceAccessibility) — read and fill the focused field
+//!   2. Input Monitoring (kTCCServiceListenEvent) — global hotkey, checked implicitly by rdev
 //!
 //! For any missing permission, opens System Preferences to the correct pane
 //! and prints a human-readable message.
@@ -12,7 +11,6 @@ fn main() {
     println!("mimir-permissions: checking required macOS permissions\n");
 
     check_accessibility();
-    check_screen_recording();
     check_input_monitoring();
 
     println!("\nDone. Restart mimir-daemon after granting permissions.");
@@ -33,22 +31,6 @@ fn check_accessibility() {
     }
     #[cfg(not(target_os = "macos"))]
     println!("⚠️   Accessibility: not applicable (non-macOS)");
-}
-
-fn check_screen_recording() {
-    #[cfg(target_os = "macos")]
-    {
-        let ok = unsafe { cg_preflight_screen_capture() };
-        if ok {
-            println!("✅  Screen Recording: granted");
-        } else {
-            println!("❌  Screen Recording: MISSING");
-            println!("    → Opening System Preferences > Privacy & Security > Screen Recording");
-            open_prefs("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    println!("⚠️   Screen Recording: not applicable (non-macOS)");
 }
 
 fn check_input_monitoring() {
@@ -73,13 +55,4 @@ unsafe fn ax_is_trusted() -> bool {
         fn AXIsProcessTrusted() -> bool;
     }
     AXIsProcessTrusted()
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn cg_preflight_screen_capture() -> bool {
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGPreflightScreenCaptureAccess() -> bool;
-    }
-    CGPreflightScreenCaptureAccess()
 }

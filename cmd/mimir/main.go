@@ -11,7 +11,6 @@ import (
 
 	"mimir/internal/browser"
 	"mimir/internal/daemon"
-	"mimir/internal/laya"
 	"mimir/internal/solver"
 	"mimir/internal/tui"
 	"mimir/internal/von"
@@ -46,17 +45,7 @@ func main() {
 
 	v := von.New(httpBase)
 
-	// Laya solver config — no OpenAI key
-	sc := solver.ConfigFromEnv()
-	if m := os.Getenv("LAYA_MODEL"); m != "" {
-		sc.Model = m
-	}
-	lc := laya.New()
-	if sc.Model != "" {
-		lc.Model = sc.Model
-	}
-
-	m := tui.New(v, sc, initialURL)
+	m := tui.New(v, solver.ConfigFromEnv(), initialURL)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)
@@ -66,12 +55,7 @@ func main() {
 
 // runDaemon starts the Unix Domain Socket server and blocks until SIGINT/SIGTERM.
 func runDaemon() {
-	sc := solver.ConfigFromEnv()
-	if m := os.Getenv("LAYA_MODEL"); m != "" {
-		sc.Model = m
-	}
-
-	srv := daemon.NewServer(sc)
+	srv := daemon.NewServer(solver.ConfigFromEnv())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

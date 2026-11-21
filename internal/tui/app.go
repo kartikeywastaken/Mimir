@@ -1389,12 +1389,16 @@ func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Confi
 	switch mode {
 	case ModeLocalAI:
 		var localErr error
-		if !isText {
-			if result, err := solver.SolveLocal(q, nil, sc); err == nil {
+		localCapable := solver.LocalCanAnswer(q, sc)
+		if localCapable {
+			result, err := solver.SolveLocal(q, nil, sc)
+			if err == nil && !result.LowConfidence {
 				return result, nil
-			} else {
-				localErr = err
 			}
+			if err == nil {
+				err = fmt.Errorf("%s confidence %d%% below threshold", result.Backend, result.Confidence)
+			}
+			localErr = err
 		}
 		evidence, webErr := research(q.Text)
 		if webErr != nil {
@@ -1404,7 +1408,7 @@ func solveWithMode(q *extractor.Question, searchVon *von.Client, sc solver.Confi
 		if err != nil {
 			return nil, fmt.Errorf("Local → Web failed: %w", err)
 		}
-		if !isText {
+		if localCapable {
 			result.FallbackPath = "Local → Web"
 		}
 		return result, nil
